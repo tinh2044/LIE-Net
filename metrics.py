@@ -20,6 +20,7 @@ def calculate_ssim(img1, img2):
 
 
 def calculate_lpips(img1, img2, device="cuda"):
+    global lpips_model
     lpips_model = lpips_model.to(device)
     with torch.no_grad():
         return lpips_model(img1, img2).mean().item()
