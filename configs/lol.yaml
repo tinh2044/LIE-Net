@@ -10,22 +10,12 @@ data:
   max_len: 1  
 
 model:
-  num_blocks: [2, 3, 3, 4]
+  num_blocks: [2, 2, 2, 2]
   num_heads: [1, 2, 4, 8]
   channels: [16, 32, 64, 128]
-  num_refinement: 4
+  num_refinement: 3
   expansion_factor: 2.66
   ch: [16, 16, 32, 64]
-
-  # Preprocessing
-  use_preprocess: true
-  preprocess_gamma: 0.8
-  preprocess_histogram_bounds: [0.01, 0.99]
-
-  # Multi-scale supervision
-  use_multiscale: true
-  multiscale_loss_weight: 0.5
-
   loss_weights:
     charbonnier: 1.0
     perceptual: 0.5
@@ -38,9 +28,9 @@ training:
   model_dir: "./outputs/LOL/"
   epochs: 800
   batch_size: 4
-  learning_rate: 0.0003
-  weight_decay: 0.0001
-  warmup_epochs: 5
+  learning_rate: 2e-4
+  weight_decay: 2e-5
+  warmup_epochs: 10
   save_freq: 10
   eval_freq: 5
   print_freq: 100

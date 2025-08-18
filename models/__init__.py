@@ -255,30 +255,16 @@ class RestorationEnhancementAttention(nn.Module):
 class LIENet(nn.Module):
     def __init__(
         self,
-        num_blocks=[2, 3, 3, 4],
+        num_blocks=[2, 2, 2, 2],
         num_heads=[1, 2, 4, 8],
         channels=[16, 32, 64, 128],
-        num_refinement=4,
+        num_refinement=2,
         expansion_factor=2.66,
         loss_weights={},
         in_channels=3,
-        # Preprocessing controls
-        use_preprocess=True,
-        preprocess_gamma=0.8,
-        preprocess_histogram_bounds=(0.01, 0.99),
-        # Multi-scale controls
-        use_multiscale=True,
-        multiscale_loss_weight=0.5,
         **kwargs,
     ):
         super(LIENet, self).__init__()
-        # -------- Preprocessing config --------
-        self.use_preprocess = use_preprocess
-        self.preprocess_gamma = preprocess_gamma
-        self.preprocess_histogram_bounds = preprocess_histogram_bounds
-        # -------- Multi-scale config --------
-        self.use_multiscale = use_multiscale
-        self.multiscale_loss_weight = multiscale_loss_weight
         self.embed_conv = nn.Conv2d(
             in_channels, channels[0], kernel_size=3, padding=1, bias=False
         )
@@ -341,20 +327,7 @@ class LIENet(nn.Module):
 
         self.out_conv = nn.Conv2d(channels[0], 3, kernel_size=3, padding=1, bias=False)
 
-        # x2 output head for multi-scale supervision
-        if self.use_multiscale:
-            # Preserve channels while upsampling to x2
-            self.up_final = nn.Sequential(
-                nn.Conv2d(
-                    channels[0], channels[0] * 4, kernel_size=3, padding=1, bias=False
-                ),
-                nn.PixelShuffle(2),
-            )
-            self.output_x2 = nn.Conv2d(
-                channels[0], 3, kernel_size=3, padding=1, bias=False
-            )
 
-        # Add IEM and NEM for loss calculation
         self.iem = IlluminationExtractionModule(channels[0])
         self.nem = NoiseEstimationModule(channels[0])
 
@@ -389,75 +362,22 @@ class LIENet(nn.Module):
         noise_map = self.nem(fr)
 
         # Base scale loss
-        loss_dict_base = self.loss_func(
+        loss = self.loss_func(
             pred=output,
             target=target,
             illumination_map=illumination_map,
             noise_map=noise_map,
         )
 
-        # Multi-scale (x2) branch
-        output_x2 = None
-        illumination_map_x2 = None
-        noise_map_x2 = None
-        if self.use_multiscale:
-            fr_up = self.up_final(fr)
-            output_x2 = self.output_x2(fr_up)
-            illumination_map_x2 = self.iem(fr_up)
-            noise_map_x2 = self.nem(fr_up)
 
-            # Create x2 target if provided
-            target_x2 = None
-            if target is not None:
-                target_x2 = F.interpolate(
-                    target, scale_factor=2, mode="bilinear", align_corners=False
-                )
-
-            loss_dict_x2 = self.loss_func(
-                pred=output_x2,
-                target=target_x2,
-                illumination_map=illumination_map_x2,
-                noise_map=noise_map_x2,
-            )
-
-            # Merge losses with weights
-            merged_losses = {}
-            # Keep detailed per-scale components for logging
-            for k, v in loss_dict_base.items():
-                if k == "total":
-                    continue
-                merged_losses[f"{k}_x1"] = v
-            for k, v in loss_dict_x2.items():
-                if k == "total":
-                    continue
-                merged_losses[f"{k}_x2"] = v
-
-            # Totals
-            merged_losses["total_x1"] = loss_dict_base.get(
-                "total", torch.tensor(0.0, device=x.device)
-            )
-            merged_losses["total_x2"] = (
-                loss_dict_x2.get("total", torch.tensor(0.0, device=x.device))
-                * self.multiscale_loss_weight
-            )
-            merged_losses["total"] = (
-                merged_losses["total_x1"] + merged_losses["total_x2"]
-            )
-
-            loss_out = merged_losses
-        else:
-            loss_out = loss_dict_base
-
+    
         return {
             "input": x,
             "output": output,
-            "output_x2": output_x2,
             "target": target,
             "illumination_map": illumination_map,
             "noise_map": noise_map,
-            "illumination_map_x2": illumination_map_x2,
-            "noise_map_x2": noise_map_x2,
-            "loss": loss_out,
+            "loss": loss,
         }
 
 
