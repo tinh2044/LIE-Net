@@ -16,9 +16,6 @@ model:
   num_refinement: 4
   expansion_factor: 2.66
   ch: [16, 16, 32, 64]
-  # Multi-scale supervision
-  use_multiscale: true
-  multiscale_loss_weight: 0.5
 
   loss_weights:
     charbonnier: 1.0
@@ -32,7 +29,7 @@ training:
   model_dir: "./outputs/LOL/"
   epochs: 800
   batch_size: 4
-  learning_rate: 2e-4
+  learning_rate: 1e-3
   weight_decay: 2e-5
   warmup_epochs: 10
   save_freq: 10
