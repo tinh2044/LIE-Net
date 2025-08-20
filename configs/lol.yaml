@@ -17,12 +17,12 @@ model:
   expansion_factor: 2.66
   ch: [16, 16, 32, 64]
   loss_weights:
-    charbonnier: 2.0
-    perceptual: 0.3
-    smoothness: 0.05
-    exposure: 0.2
-    noise_aware: 0.2
-    edge: 0.8
+    charbonnier: 3.0
+    perceptual: 0.2
+    smoothness: 0.02
+    exposure: 0.1
+    noise_aware: 0.05
+    edge: 0.5
   
 
 training:

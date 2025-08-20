@@ -159,7 +159,11 @@ class NoiseAwareReconstructionLoss(nn.Module):
             noise_map = torch.mean(noise_map, dim=1, keepdim=True)
             noise_map = noise_map.repeat(1, 3, 1, 1)
 
-        weight = 1 - noise_map
+        # Clip noise_map to prevent extreme values
+        noise_map = torch.clamp(noise_map, 0.0, 1.0)
+
+        # Ensure weight is always positive and reasonable
+        weight = torch.clamp(1 - noise_map, 0.1, 1.0)
         loss = torch.abs(pred - target) * weight
         return torch.mean(loss)
 
@@ -209,6 +213,11 @@ class LowLightLoss(nn.Module):
         total_loss = 0
         for loss_name, loss_value in losses.items():
             if loss_name in self.weights:
+                # Clip individual losses to prevent explosion
+                loss_value = torch.clamp(loss_value, -100.0, 100.0)
                 total_loss += self.weights[loss_name] * loss_value
+
+        # Clip total loss to prevent gradient explosion
+        total_loss = torch.clamp(total_loss, -1000.0, 1000.0)
         losses["total"] = total_loss
         return losses

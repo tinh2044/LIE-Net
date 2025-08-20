@@ -14,11 +14,11 @@ class IlluminationExtractionModule(nn.Module):
     def __init__(self, channels):
         super(IlluminationExtractionModule, self).__init__()
         self.conv = nn.Conv2d(channels, channels, kernel_size=3, padding=1, bias=False)
-        # Use ReLU instead of sigmoid for sharper illumination maps
-        self.activation = nn.ReLU(inplace=True)
+        # Keep sigmoid for illumination maps to maintain proper range [0,1]
+        self.sigmoid = nn.Sigmoid()
 
     def forward(self, x):
-        illumination_map = self.activation(self.conv(x))
+        illumination_map = self.sigmoid(self.conv(x))
         return illumination_map
 
 
@@ -26,11 +26,11 @@ class NoiseEstimationModule(nn.Module):
     def __init__(self, channels):
         super(NoiseEstimationModule, self).__init__()
         self.conv = nn.Conv2d(channels, channels, kernel_size=3, padding=1, bias=False)
-        # Use ReLU instead of sigmoid for sharper noise maps
-        self.activation = nn.ReLU(inplace=True)
+        # Keep sigmoid for noise maps to maintain proper range [0,1]
+        self.sigmoid = nn.Sigmoid()
 
     def forward(self, x):
-        out = self.activation(self.conv(x))
+        out = self.sigmoid(self.conv(x))
         return out
 
 
