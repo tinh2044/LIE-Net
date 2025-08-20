@@ -14,10 +14,11 @@ class IlluminationExtractionModule(nn.Module):
     def __init__(self, channels):
         super(IlluminationExtractionModule, self).__init__()
         self.conv = nn.Conv2d(channels, channels, kernel_size=3, padding=1, bias=False)
-        self.sigmoid = nn.Sigmoid()
+        # Use ReLU instead of sigmoid for sharper illumination maps
+        self.activation = nn.ReLU(inplace=True)
 
     def forward(self, x):
-        illumination_map = self.sigmoid(self.conv(x))
+        illumination_map = self.activation(self.conv(x))
         return illumination_map
 
 
@@ -25,10 +26,11 @@ class NoiseEstimationModule(nn.Module):
     def __init__(self, channels):
         super(NoiseEstimationModule, self).__init__()
         self.conv = nn.Conv2d(channels, channels, kernel_size=3, padding=1, bias=False)
-        self.sigmoid = nn.Sigmoid()
+        # Use ReLU instead of sigmoid for sharper noise maps
+        self.activation = nn.ReLU(inplace=True)
 
     def forward(self, x):
-        out = self.sigmoid(self.conv(x))
+        out = self.activation(self.conv(x))
         return out
 
 
@@ -47,7 +49,8 @@ class IlluminationAwareGate(nn.Module):
         )
         self.act = nn.GELU()
         self.conv_pw = nn.Conv1d(1, 1, kernel_size=1, bias=False)
-        self.sigmoid = nn.Sigmoid()
+        # Use ReLU instead of sigmoid for sharper activation
+        self.activation = nn.ReLU(inplace=True)
 
     def kernel_size(self):
         k = int(abs((math.log2(self.channels) / self.gamma) + self.b / self.gamma))
@@ -66,8 +69,10 @@ class IlluminationAwareGate(nn.Module):
         y = self.act(y)
         y = self.conv_pw(y)
         y = y.transpose(-1, -2).unsqueeze(-1)
-        y = self.sigmoid(y)
-        out = x * y.expand_as(x)
+        # Use ReLU and add residual connection
+        y = self.activation(y)
+        # Add residual connection to preserve original features
+        out = x * (0.5 + 0.5 * y.expand_as(x))
         return out
 
 
@@ -327,7 +332,6 @@ class LIENet(nn.Module):
 
         self.out_conv = nn.Conv2d(channels[0], 3, kernel_size=3, padding=1, bias=False)
 
-
         self.iem = IlluminationExtractionModule(channels[0])
         self.nem = NoiseEstimationModule(channels[0])
 
@@ -369,8 +373,6 @@ class LIENet(nn.Module):
             noise_map=noise_map,
         )
 
-
-    
         return {
             "input": x,
             "output": output,

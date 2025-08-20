@@ -107,13 +107,45 @@ class IlluminationSmoothnessLoss(nn.Module):
         super(IlluminationSmoothnessLoss, self).__init__()
 
     def forward(self, illumination_map):
+        # Reduce the impact of smoothness loss
         grad_x = torch.abs(
             illumination_map[:, :, :, :-1] - illumination_map[:, :, :, 1:]
         )
         grad_y = torch.abs(
             illumination_map[:, :, :-1, :] - illumination_map[:, :, 1:, :]
         )
-        return torch.mean(grad_x) + torch.mean(grad_y)
+        # Apply a smaller weight to smoothness
+        return 0.1 * (torch.mean(grad_x) + torch.mean(grad_y))
+
+
+class EdgePreservationLoss(nn.Module):
+    """Edge preservation loss to maintain sharpness"""
+
+    def __init__(self):
+        super(EdgePreservationLoss, self).__init__()
+        # Sobel filters for edge detection
+        self.sobel_x = torch.tensor(
+            [[-1, 0, 1], [-2, 0, 2], [-1, 0, 1]], dtype=torch.float32
+        ).view(1, 1, 3, 3)
+        self.sobel_y = torch.tensor(
+            [[-1, -2, -1], [0, 0, 0], [1, 2, 1]], dtype=torch.float32
+        ).view(1, 1, 3, 3)
+
+    def forward(self, pred, target):
+        if pred.device != self.sobel_x.device:
+            self.sobel_x = self.sobel_x.to(pred.device)
+            self.sobel_y = self.sobel_y.to(pred.device)
+
+        # Compute gradients for each channel
+        pred_grad_x = F.conv2d(pred, self.sobel_x.repeat(3, 1, 1, 1), groups=3)
+        pred_grad_y = F.conv2d(pred, self.sobel_y.repeat(3, 1, 1, 1), groups=3)
+        pred_grad = torch.sqrt(pred_grad_x**2 + pred_grad_y**2)
+
+        target_grad_x = F.conv2d(target, self.sobel_x.repeat(3, 1, 1, 1), groups=3)
+        target_grad_y = F.conv2d(target, self.sobel_y.repeat(3, 1, 1, 1), groups=3)
+        target_grad = torch.sqrt(target_grad_x**2 + target_grad_y**2)
+
+        return F.l1_loss(pred_grad, target_grad)
 
 
 class NoiseAwareReconstructionLoss(nn.Module):
@@ -155,6 +187,7 @@ class LowLightLoss(nn.Module):
         self.smoothness_loss = IlluminationSmoothnessLoss()
         self.exposure_loss = ExposureControlLoss()
         self.noise_aware_loss = NoiseAwareReconstructionLoss()
+        self.edge_loss = EdgePreservationLoss()
 
     def forward(self, pred, target=None, illumination_map=None, noise_map=None):
         if target is None:
@@ -163,6 +196,7 @@ class LowLightLoss(nn.Module):
 
         losses["charbonnier"] = self.charbonnier_loss(pred, target)
         losses["perceptual"] = self.perceptual_loss(pred, target)
+        losses["edge"] = self.edge_loss(pred, target)
 
         if illumination_map is not None:
             losses["smoothness"] = self.smoothness_loss(illumination_map)
