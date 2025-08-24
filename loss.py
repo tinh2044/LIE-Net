@@ -399,7 +399,7 @@ class EdgeLoss(nn.Module):
     def conv_gauss(self, img):
         n_channels, _, kw, kh = self.kernel.shape
         img = F.pad(img, (kw // 2, kh // 2, kw // 2, kh // 2), mode="replicate")
-        return F.conv2d(img, self.kernel, groups=n_channels)
+        return F.conv2d(img, self.kernel.to(img.device), groups=n_channels)
 
     def laplacian_kernel(self, current):
         filtered = self.conv_gauss(current)
