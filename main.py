@@ -15,7 +15,7 @@ from loguru import logger
 
 from optimizer import build_optimizer, build_scheduler
 from dataset import get_training_set, get_test_set
-from models import LIENet
+from net import LIENet
 from opt import train_one_epoch, evaluate_fn
 import utils
 
@@ -38,7 +38,7 @@ def get_args_parser():
     parser.add_argument("--local_rank", default=0, type=int)
 
     parser.add_argument(
-        "--device", default="cuda", help="device to use for training / testing"
+        "--device", default="cpu", help="device to use for training / testing"
     )
     parser.add_argument("--seed", default=42, type=int)
     parser.add_argument("--resume", default="", help="resume from checkpoint")
@@ -51,7 +51,7 @@ def get_args_parser():
     parser.add_argument(
         "--cfg_path",
         type=str,
-        default="configs/low_light.yaml",
+        default="configs/lol.yaml",
         help="Path to config file",
     )
 

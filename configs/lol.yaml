@@ -16,14 +16,17 @@ model:
   num_refinement: 4
   expansion_factor: 2.66
   ch: [16, 16, 32, 64]
-  loss_weights:
-    charbonnier: 3.0
+  loss:
+    charbonnier1: 1.0
     perceptual: 0.2
-    smoothness: 0.02
-    exposure: 0.1
-    noise_aware: 0.05
     edge: 0.5
-  
+    frequency: 0.001
+    perceptual_criterion: "l2"
+    perceptual_reduction: "mean"
+    edge_criterion: "l2"
+    edge_reduction: "mean"
+    frequency_criterion: "l2"
+    frequency_reduction: "mean"
 
 training:
   model_dir: "./outputs/LOL/"

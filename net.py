@@ -265,7 +265,7 @@ class LIENet(nn.Module):
         channels=[16, 32, 64, 128],
         num_refinement=2,
         expansion_factor=2.66,
-        loss_weights={},
+        loss={},
         in_channels=3,
         **kwargs,
     ):
@@ -332,10 +332,7 @@ class LIENet(nn.Module):
 
         self.out_conv = nn.Conv2d(channels[0], 3, kernel_size=3, padding=1, bias=False)
 
-        self.iem = IlluminationExtractionModule(channels[0])
-        self.nem = NoiseEstimationModule(channels[0])
-
-        self.loss_func = LowLightLoss(loss_weights)
+        self.loss_func = LowLightLoss(loss)
 
     def forward(self, x, target=None):
         fo = self.embed_conv(x)
@@ -362,23 +359,18 @@ class LIENet(nn.Module):
         fr = self.refinement(fo)
         output = self.out_conv(fr)
 
-        illumination_map = self.iem(fr)
-        noise_map = self.nem(fr)
-
-        # Base scale loss
-        loss = self.loss_func(
-            pred=output,
-            target=target,
-            illumination_map=illumination_map,
-            noise_map=noise_map,
-        )
+        if target is not None:
+            loss = self.loss_func(
+                pred=output,
+                target=target,
+            )
+        else:
+            loss = None
 
         return {
             "input": x,
             "output": output,
             "target": target,
-            "illumination_map": illumination_map,
-            "noise_map": noise_map,
             "loss": loss,
         }
 
@@ -387,3 +379,5 @@ if __name__ == "__main__":
     model = LIENet(in_channels=3)
     input = torch.randn(1, 3, 256, 256)
     output = model(input)
+
+    print(output["loss"])
