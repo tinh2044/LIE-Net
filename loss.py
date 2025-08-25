@@ -251,7 +251,8 @@ class FrequencyLoss(nn.Module):
         return self.loss_weight * self.criterion(pred_freq, target_freq)
 
     def get_fft_amplitude(self, inp):
-        inp_freq = torch.fft.rfft2(inp, norm="backward")
+        # Use "forward" norm to normalize by sqrt(N) and match typical FFT scale
+        inp_freq = torch.fft.rfft2(inp, norm="forward")
         amp = torch.abs(inp_freq)
         return amp
 
@@ -325,8 +326,8 @@ class VGGLoss(nn.Module):
         for x in range(21, 30):
             self.slice5.add_module(str(x), vgg_pretrained_features[x])
 
-        for param in self.parameters():
-            param.requires_grad = False
+        # Don't freeze parameters - let them be part of the loss computation
+        # but they won't be updated during training since VGGLoss is not part of model
 
         del vgg_pretrained_features
 
@@ -438,38 +439,6 @@ class SSIMloss(nn.Module):
 
     def forward(self, pred, target, **kwargs):
         return self.loss_weight * (1 - SSIM_loss(pred, target, self.data_range))
-
-
-class EnhanceLoss(nn.Module):
-    """
-    Applies the enhanceLoss. This loss is the l1 loss of the image downsampled at the middle of the
-    encoder-decoder plus the l1 of the features of this downsample image given by the vgg19 (a perceptual
-    element).
-    """
-
-    def __init__(self, loss_weight=1.0, criterion="l1", reduction="mean"):
-        super(EnhanceLoss, self).__init__()
-        self.loss_weight = loss_weight
-        if reduction not in ["none", "mean", "sum"]:
-            raise ValueError(
-                f"Unsupported reduction mode: {reduction}. "
-                f"Supported ones are: {_reduction_modes}"
-            )
-
-        if criterion == "l1":
-            self.criterion = nn.L1Loss(reduction=reduction)
-        elif criterion == "l2":
-            self.criterion = nn.MSELoss(reduction=reduction)
-        else:
-            raise NotImplementedError("Unsupported criterion loss")
-
-        self.vgg19 = VGGLoss(loss_weight=0.01, criterion=criterion, reduction="mean")
-
-    def forward(self, gt, enhanced, scale_factor=16):
-        gt_low_res = F.interpolate(gt, scale_factor=scale_factor, mode="nearest")
-        return self.vgg19(gt_low_res, enhanced) + self.loss_weight * self.criterion(
-            gt_low_res, enhanced
-        )
 
 
 class LowLightLoss(nn.Module):

@@ -13,6 +13,7 @@ from pathlib import Path
 from loguru import logger
 
 
+from loss import LowLightLoss
 from optimizer import build_optimizer, build_scheduler
 from dataset import get_training_set, get_test_set
 from net import LIENet
@@ -102,6 +103,10 @@ def main(args, cfg):
     model = LIENet(**cfg["model"])
     model = model.to(device)
     n_parameters = utils.count_model_parameters(model)
+
+    # Create loss function
+    loss_weights = cfg["model"]["loss"]
+    loss_fn = LowLightLoss(loss_weights)
 
     print(f"Number of parameters: {n_parameters}")
 
@@ -193,6 +198,7 @@ def main(args, cfg):
             test_dataloader,
             model,
             epoch=0,
+            loss_fn=loss_fn,
             print_freq=args.print_freq,
             results_path=f"{model_dir}/test_results.json",
             log_dir=f"{log_dir}/eval/test",
@@ -216,7 +222,9 @@ def main(args, cfg):
             model,
             train_dataloader,
             optimizer,
+            scheduler,
             epoch,
+            loss_fn,
             print_freq=args.print_freq,
             log_dir=f"{log_dir}/train",
         )
@@ -245,6 +253,7 @@ def main(args, cfg):
             test_dataloader,
             model,
             epoch,
+            loss_fn,
             print_freq=args.print_freq,
             log_dir=f"{log_dir}/test",
         )

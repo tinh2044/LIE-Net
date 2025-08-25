@@ -332,9 +332,7 @@ class LIENet(nn.Module):
 
         self.out_conv = nn.Conv2d(channels[0], 3, kernel_size=3, padding=1, bias=False)
 
-        self.loss_func = LowLightLoss(loss)
-
-    def forward(self, x, target=None):
+    def forward(self, x):
         fo = self.embed_conv(x)
 
         # Encoder
@@ -359,20 +357,7 @@ class LIENet(nn.Module):
         fr = self.refinement(fo)
         output = self.out_conv(fr)
 
-        if target is not None:
-            loss = self.loss_func(
-                pred=output,
-                target=target,
-            )
-        else:
-            loss = None
-
-        return {
-            "input": x,
-            "output": output,
-            "target": target,
-            "loss": loss,
-        }
+        return output
 
 
 if __name__ == "__main__":
@@ -380,4 +365,4 @@ if __name__ == "__main__":
     input = torch.randn(1, 3, 256, 256)
     output = model(input)
 
-    print(output["loss"])
+    print(f"Output shape: {output.shape}")

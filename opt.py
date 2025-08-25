@@ -6,7 +6,15 @@ from logger import MetricLogger, SmoothedValue
 
 
 def train_one_epoch(
-    args, model, data_loader, optimizer, epoch, print_freq=10, log_dir="logs"
+    args,
+    model,
+    data_loader,
+    optimizer,
+    scheduler,
+    epoch,
+    loss_fn,
+    print_freq=10,
+    log_dir="logs",
 ):
     """Train for one epoch"""
     model.train()
@@ -26,17 +34,17 @@ def train_one_epoch(
         targets = batch["targets"].to(args.device)
 
         # Forward pass
-        outputs = model(inputs, targets)
+        pred_l = model(inputs)
 
-        pred_l = outputs["output"]
-
-        loss_dict = outputs["loss"]
+        # Compute loss
+        loss_dict = loss_fn(pred_l, targets)
         total_loss = loss_dict["total"]
 
         # Backward pass
         optimizer.zero_grad()
         total_loss.backward()
         optimizer.step()
+        scheduler.step()
 
         # Update metrics
         for loss_name, loss_value in loss_dict.items():
@@ -56,7 +64,14 @@ def train_one_epoch(
 
 
 def evaluate_fn(
-    args, data_loader, model, epoch, print_freq=100, results_path=None, log_dir="logs"
+    args,
+    data_loader,
+    model,
+    epoch,
+    loss_fn,
+    print_freq=100,
+    results_path=None,
+    log_dir="logs",
 ):
     """Evaluate model"""
     model.eval()
@@ -73,9 +88,11 @@ def evaluate_fn(
             filenames = batch["filenames"]
 
             # Forward pass
-            outputs = model(inputs, targets)
-            pred_l = outputs["output"]
-            for loss_name, loss_value in outputs["loss"].items():
+            pred_l = model(inputs)
+
+            # Compute loss
+            loss_dict = loss_fn(pred_l, targets)
+            for loss_name, loss_value in loss_dict.items():
                 metric_logger.update(**{f"{loss_name}_loss": loss_value.item()})
 
             metrics = compute_metrics(targets, pred_l, args.device)
