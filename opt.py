@@ -73,7 +73,7 @@ def evaluate_fn(
             filenames = batch["filenames"]
 
             # Forward pass
-            outputs = model(inputs)
+            outputs = model(inputs, targets)
             pred_l = outputs["output"]
             for loss_name, loss_value in outputs["loss"].items():
                 metric_logger.update(**{f"{loss_name}_loss": loss_value.item()})
