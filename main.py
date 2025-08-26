@@ -106,8 +106,7 @@ def main(args, cfg):
 
     # Create loss function
     loss_weights = cfg["model"]["loss"]
-    loss_fn = LowLightLoss(loss_weights)
-
+    loss_fn = LowLightLoss(loss_weights, device=device)
     print(f"Number of parameters: {n_parameters}")
 
     # Calculate model info
