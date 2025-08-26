@@ -3,7 +3,7 @@ import os
 import yaml
 import torch
 from torch.utils.data import DataLoader
-from models import Phaseformer
+from net import LIENet
 from utils import save_img, get_model_info
 
 
@@ -57,7 +57,7 @@ def main(args):
     os.makedirs(args.output_dir, exist_ok=True)
 
     # Create model
-    model = Phaseformer(**config["model"]).to(device)
+    model = LIENet(**config["model"]).to(device)
 
     # Load pretrained weights
     print(f"Loading model from {args.pretrained_model}")

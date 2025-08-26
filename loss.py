@@ -100,11 +100,11 @@ class HighFreqLoss(nn.Module):
         self.register_buffer("g", k.view(1, 1, 5, 5))
 
     def _hp(self, x):
-        outs = []
-        for c in range(x.shape[1]):
-            blur = F.conv2d(x[:, c : c + 1], self.g, padding=2)
-            outs.append(x[:, c : c + 1] - blur)
-        return torch.cat(outs, 1)
+        # x: (B, C, H, W)
+        g = self.g.to(x.device)  # ensure kernel on same device
+        g = g.expand(x.shape[1], 1, 5, 5)  # depthwise: one kernel per channel
+        blur = F.conv2d(x, g, padding=2, groups=x.shape[1])
+        return x - blur
 
     def forward(self, pred, target):
         hp_p, hp_t = self._hp(pred), self._hp(target)
@@ -151,14 +151,8 @@ class VGGLoss(nn.Module):
         return self.w * loss
 
 
-class PSNR(nn.Module):
-    def forward(self, pred, target, eps=1e-8):
-        mse = F.mse_loss(pred, target, reduction="mean")
-        return 10 * torch.log10(1.0 / (mse + eps))
-
-
 class LowLightLoss(nn.Module):
-    def __init__(self, loss_weights: Dict):
+    def __init__(self, loss_weights: Dict, device):
         super().__init__()
         w = lambda k, d: loss_weights.get(k, d)
         self.charb = charbonnier_loss
@@ -168,25 +162,27 @@ class LowLightLoss(nn.Module):
             loss_weight=w("chroma", 1.0),
             reduction=loss_weights.get("chroma_reduction", "mean"),
             criterion=loss_weights.get("chroma_criterion", "l1"),
-        )
+        ).to(device)
 
         self.edge = EdgeLoss(
             loss_weight=w("edge", 0.5),
             reduction=loss_weights.get("edge_reduction", "mean"),
             criterion=loss_weights.get("edge_criterion", "l1"),
-        )
+        ).to(device)
 
         self.hfreq = HighFreqLoss(
             loss_weight=w("frequency", 0.5),
             reduction=loss_weights.get("frequency_reduction", "mean"),
             criterion=loss_weights.get("frequency_criterion", "l1"),
-        )
+        ).to(device)
 
         self.vgg = VGGLoss(
             loss_weight=w("perceptual", 0.2),
             reduction=loss_weights.get("perceptual_reduction", "mean"),
             criterion=loss_weights.get("perceptual_criterion", "l1"),
-        )
+        ).to(device)
+
+        self.device = device
 
     def forward(self, pred, target):
         pred = pred.clamp(0, 1)
