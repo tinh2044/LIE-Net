@@ -50,7 +50,7 @@ def get_args_parser():
     parser.add_argument("--num_workers", default=4, type=int)
 
     parser.add_argument(
-        "--cfg_path",
+        "--cfg",
         type=str,
         default="configs/lol.yaml",
         help="Path to config file",
@@ -298,7 +298,7 @@ if __name__ == "__main__":
     )
     args = parser.parse_args()
 
-    with open(args.cfg_path, "r+", encoding="utf-8") as f:
+    with open(args.cfg, "r+", encoding="utf-8") as f:
         config = yaml.load(f, Loader=yaml.FullLoader)
 
     Path(config["training"]["model_dir"]).mkdir(parents=True, exist_ok=True)

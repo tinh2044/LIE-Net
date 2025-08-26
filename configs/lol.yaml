@@ -5,8 +5,6 @@ data:
   input_dir: "low"
   target_dir: "light"  
   image_size: 256
-  batch_size: 4
-  num_workers: 4
   max_len: 1  
 
 model:
@@ -17,26 +15,17 @@ model:
   expansion_factor: 2.66
   ch: [16, 16, 32, 64]
   loss:
-    charbonnier1: 1.0
-    perceptual: 0.2
+    charbonnier: 1.0
+    chroma: 1.0
     edge: 0.5
-    frequency: 0.001
-    perceptual_criterion: "l2"
-    perceptual_reduction: "mean"
-    edge_criterion: "l2"
-    edge_reduction: "mean"
-    frequency_criterion: "l2"
-    frequency_reduction: "mean"
+    frequency: 0.5
+    perceptual: 0.2
 
 training:
-  model_dir: "./outputs/LOL/"
-  epochs: 800
-  batch_size: 4
+  model_dir: "./datasets_LOL"
   learning_rate: 1e-3
   weight_decay: 2e-5
   warmup_epochs: 0
-  save_freq: 10
-  eval_freq: 5
   print_freq: 100
   
   optimization:
