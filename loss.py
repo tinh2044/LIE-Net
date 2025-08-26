@@ -1,206 +1,485 @@
 import functools
 from typing import Dict
 import torch
-from torch import nn
+from torch import nn as nn
+from torchvision.models import vgg as vgg
+
+from torch import autograd as autograd
 from torch.nn import functional as F
 import torchvision
+import pytorch_msssim
+
+_reduction_modes = ["none", "mean", "sum"]
 
 
-def _reduce(loss, reduction):
-    if reduction == "none":
+def reduce_loss(loss, reduction):
+    """Reduce loss as specified.
+
+    Args:
+        loss (Tensor): Elementwise loss tensor.
+        reduction (str): Options are 'none', 'mean' and 'sum'.
+
+    Returns:
+        Tensor: Reduced loss tensor.
+    """
+    reduction_enum = F._Reduction.get_enum(reduction)
+    # none: 0, elementwise_mean:1, sum: 2
+    if reduction_enum == 0:
         return loss
-    if reduction == "mean":
+    elif reduction_enum == 1:
         return loss.mean()
-    if reduction == "sum":
+    else:
         return loss.sum()
-    raise ValueError(f"reduction={reduction}")
 
 
-def _weighted(loss, weight, reduction="mean"):
+def weight_reduce_loss(loss, weight=None, reduction="mean"):
+    """Apply element-wise weight and reduce loss.
+
+    Args:
+        loss (Tensor): Element-wise loss.
+        weight (Tensor): Element-wise weights. Default: None.
+        reduction (str): Same as built-in losses of PyTorch. Options are
+            'none', 'mean' and 'sum'. Default: 'mean'.
+
+    Returns:
+        Tensor: Loss values.
+    """
+    # if weight is specified, apply element-wise weight
     if weight is not None:
         assert weight.dim() == loss.dim()
+        assert weight.size(1) == 1 or weight.size(1) == loss.size(1)
         loss = loss * weight
-    return _reduce(loss, reduction)
+
+    # if weight is not specified or reduction is sum, just reduce the loss
+    if weight is None or reduction == "sum":
+        loss = reduce_loss(loss, reduction)
+    # if reduction is mean, then compute mean over weight region
+    elif reduction == "mean":
+        if weight.size(1) > 1:
+            weight = weight.sum()
+        else:
+            weight = weight.sum() * loss.size(1)
+        loss = loss.sum() / weight
+
+    return loss
 
 
-def weighted_loss(fn):
-    @functools.wraps(fn)
-    def wrap(pred, target, weight=None, reduction="mean", **kw):
-        loss = fn(pred, target, **kw)
-        return _weighted(loss, weight, reduction)
+def weighted_loss(loss_func):
+    """Create a weighted version of a given loss function.
 
-    return wrap
+    To use this decorator, the loss function must have the signature like
+    `loss_func(pred, target, **kwargs)`. The function only needs to compute
+    element-wise loss without any reduction. This decorator will add weight
+    and reduction arguments to the function. The decorated function will have
+    the signature like `loss_func(pred, target, weight=None, reduction='mean',
+    **kwargs)`.
+
+    :Example:
+
+    >>> import torch
+    >>> @weighted_loss
+    >>> def l1_loss(pred, target):
+    >>>     return (pred - target).abs()
+
+    >>> pred = torch.Tensor([0, 2, 3])
+    >>> target = torch.Tensor([1, 1, 1])
+    >>> weight = torch.Tensor([1, 0, 1])
+
+    >>> l1_loss(pred, target)
+    tensor(1.3333)
+    >>> l1_loss(pred, target, weight)
+    tensor(1.5000)
+    >>> l1_loss(pred, target, reduction='none')
+    tensor([1., 1., 2.])
+    >>> l1_loss(pred, target, weight, reduction='sum')
+    tensor(3.)
+    """
+
+    @functools.wraps(loss_func)
+    def wrapper(pred, target, weight=None, reduction="mean", **kwargs):
+        # get element-wise loss
+        loss = loss_func(pred, target, **kwargs)
+        loss = weight_reduce_loss(loss, weight, reduction)
+        return loss
+
+    return wrapper
 
 
 @weighted_loss
-def charbonnier_loss(pred, target, eps=1e-3):
-    return torch.sqrt((pred - target) ** 2 + eps * eps)
+def l1_loss(pred, target):
+    return F.l1_loss(pred, target, reduction="none")
 
 
-def _rgb_to_ycbcr(x):
-    r, g, b = x[:, 0:1], x[:, 1:2], x[:, 2:3]
-    Y = 0.299 * r + 0.587 * g + 0.114 * b
-    Cb = 0.564 * (b - Y)
-    Cr = 0.713 * (r - Y)
-    return Y, Cb, Cr
+@weighted_loss
+def mse_loss(pred, target):
+    return F.mse_loss(pred, target, reduction="none")
 
 
-class ChromaLoss(nn.Module):
-    def __init__(self, loss_weight=1.0, reduction="mean", criterion="l1"):
-        super().__init__()
-        self.w = loss_weight
+@weighted_loss
+def log_mse_loss(pred, target):
+    return torch.log(F.mse_loss(pred, target, reduction="none"))
+
+
+@weighted_loss
+def charbonnier_loss(pred, target, eps=1e-12):
+    return torch.sqrt((pred - target) ** 2 + eps)
+
+
+@weighted_loss
+def psnr_loss(pred, target):
+    mseloss = F.mse_loss(pred, target, reduction="none").mean((1, 2, 3))
+    psnr_val = 10 * torch.log10(1 / mseloss).mean().item()
+    return psnr_val
+
+
+class PSNRLoss(nn.Module):
+    def __init__(self, loss_weight=1.0):
+        super(PSNRLoss, self).__init__()
+        self.loss_weight = loss_weight
+
+    def forward(self, pred, target, weight=None, **kwargs):
+        """
+        Args:
+            pred (Tensor): of shape (N, C, H, W). Predicted tensor.
+            target (Tensor): of shape (N, C, H, W). Ground truth tensor.
+            weight (Tensor, optional): of shape (N, C, H, W). Element-wise
+                weights. Default: None.
+        """
+        return self.loss_weight * psnr_loss(pred, target, weight) * -1.0
+
+
+class L1Loss(nn.Module):
+    """L1 (mean absolute error, MAE) loss.
+
+    Args:
+        loss_weight (float): Loss weight for L1 loss. Default: 1.0.
+        reduction (str): Specifies the reduction to apply to the output.
+            Supported choices are 'none' | 'mean' | 'sum'. Default: 'mean'.
+    """
+
+    def __init__(self, loss_weight=1.0, reduction="mean"):
+        super(L1Loss, self).__init__()
+        if reduction not in ["none", "mean", "sum"]:
+            raise ValueError(
+                f"Unsupported reduction mode: {reduction}. "
+                f"Supported ones are: {_reduction_modes}"
+            )
+
+        self.loss_weight = loss_weight
         self.reduction = reduction
-        self.crit = F.l1_loss if criterion == "l1" else F.mse_loss
 
-    def forward(self, pred, target):
-        _, pCb, pCr = _rgb_to_ycbcr(pred.clamp(0, 1))
-        _, tCb, tCr = _rgb_to_ycbcr(target.clamp(0, 1))
-        l = self.crit(pCb, tCb, reduction=self.reduction) + self.crit(
-            pCr, tCr, reduction=self.reduction
+    def forward(self, pred, target, weight=None, **kwargs):
+        """
+        Args:
+            pred (Tensor): of shape (N, C, H, W). Predicted tensor.
+            target (Tensor): of shape (N, C, H, W). Ground truth tensor.
+            weight (Tensor, optional): of shape (N, C, H, W). Element-wise
+                weights. Default: None.
+        """
+        return self.loss_weight * l1_loss(
+            pred, target, weight, reduction=self.reduction
         )
-        return self.w * l
 
 
-def _sobel_kernels(device):
-    kx = torch.tensor(
-        [[-1, 0, 1], [-2, 0, 2], [-1, 0, 1]], dtype=torch.float32, device=device
-    ).view(1, 1, 3, 3)
-    ky = kx.transpose(2, 3)
-    return kx, ky
+class MSELoss(nn.Module):
+    """MSE (L2) loss.
 
+    Args:
+        loss_weight (float): Loss weight for MSE loss. Default: 1.0.
+        reduction (str): Specifies the reduction to apply to the output.
+            Supported choices are 'none' | 'mean' | 'sum'. Default: 'mean'.
+    """
 
-class EdgeLoss(nn.Module):
-    def __init__(self, loss_weight=0.5, reduction="mean", criterion="l1"):
-        super().__init__()
-        self.w = loss_weight
+    def __init__(self, loss_weight=1.0, reduction="mean"):
+        super(MSELoss, self).__init__()
+        if reduction not in ["none", "mean", "sum"]:
+            raise ValueError(
+                f"Unsupported reduction mode: {reduction}. "
+                f"Supported ones are: {_reduction_modes}"
+            )
+
+        self.loss_weight = loss_weight
         self.reduction = reduction
-        self.crit = F.l1_loss if criterion == "l1" else F.mse_loss
 
-    def _edge(self, x):
-        Y, _, _ = _rgb_to_ycbcr(x.clamp(0, 1))
-        kx, ky = _sobel_kernels(Y.device)
-        gx = F.conv2d(Y, kx, padding=1)
-        gy = F.conv2d(Y, ky, padding=1)
-        return torch.sqrt(gx * gx + gy * gy + 1e-6)
+    def forward(self, pred, target, weight=None, **kwargs):
+        """
+        Args:
+            pred (Tensor): of shape (N, C, H, W). Predicted tensor.
+            target (Tensor): of shape (N, C, H, W). Ground truth tensor.
+            weight (Tensor, optional): of shape (N, C, H, W). Element-wise
+                weights. Default: None.
+        """
 
-    def forward(self, pred, target):
-        l = self.crit(self._edge(pred), self._edge(target), reduction=self.reduction)
-        return self.w * l
+        return self.loss_weight * mse_loss(
+            pred, target, weight, reduction=self.reduction
+        )
 
 
-class HighFreqLoss(nn.Module):
-    def __init__(self, loss_weight=0.5, reduction="mean", criterion="l1"):
-        super().__init__()
-        self.w = loss_weight
+class FrequencyLoss(nn.Module):
+    """
+    Calculates the amplitude of frequencies loss.
+    """
+
+    def __init__(self, loss_weight=0.01, criterion="l2", reduction="mean"):
+        super(FrequencyLoss, self).__init__()
+        if reduction not in ["none", "mean", "sum"]:
+            raise ValueError(
+                f"Unsupported reduction mode: {reduction}. "
+                f"Supported ones are: {_reduction_modes}"
+            )
+        self.loss_weight = loss_weight
         self.reduction = reduction
-        self.crit = F.l1_loss if criterion == "l1" else F.mse_loss
-        k = torch.tensor([1.0, 4.0, 6.0, 4.0, 1.0])
-        k = k[:, None] * k[None, :]
-        k = k / k.sum()
-        self.register_buffer("g", k.view(1, 1, 5, 5))
 
-    def _hp(self, x):
-        # x: (B, C, H, W)
-        g = self.g.to(x.device)  # ensure kernel on same device
-        g = g.expand(x.shape[1], 1, 5, 5)  # depthwise: one kernel per channel
-        blur = F.conv2d(x, g, padding=2, groups=x.shape[1])
-        return x - blur
+        if criterion == "l1":
+            self.criterion = nn.L1Loss(reduction=reduction)
+        elif criterion == "l2":
+            self.criterion = nn.MSELoss(reduction=reduction)
+        else:
+            raise NotImplementedError("Unsupported criterion loss")
 
-    def forward(self, pred, target):
-        hp_p, hp_t = self._hp(pred), self._hp(target)
-        return self.w * self.crit(hp_p, hp_t, reduction=self.reduction)
+    def forward(self, pred, target, weight=None, **kwargs):
+        """
+        Args:
+            pred (Tensor): of shape (N, C, H, W). Predicted tensor.
+            target (Tensor): of shape (N, C, H, W). Ground truth tensor.
+            weight (Tensor, optional): of shape (N, C, H, W). Element-wise
+                weights. Default: None.
+        """
+        pred_freq = self.get_fft_amplitude(pred)
+        target_freq = self.get_fft_amplitude(target)
+
+        return self.loss_weight * self.criterion(pred_freq, target_freq)
+
+    def get_fft_amplitude(self, inp):
+        # Use "forward" norm to normalize by sqrt(N) and match typical FFT scale
+        inp_freq = torch.fft.rfft2(inp, norm="forward")
+        amp = torch.abs(inp_freq)
+        return amp
+
+
+class CharbonnierLoss(nn.Module):
+    """Charbonnier loss (one variant of Robust L1Loss, a differentiable
+    variant of L1Loss).
+
+    Described in "Deep Laplacian Pyramid Networks for Fast and Accurate
+        Super-Resolution".
+
+    Args:
+        loss_weight (float): Loss weight for L1 loss. Default: 1.0.
+        reduction (str): Specifies the reduction to apply to the output.
+            Supported choices are 'none' | 'mean' | 'sum'. Default: 'mean'.
+        eps (float): A value used to control the curvature near zero.
+            Default: 1e-12.
+    """
+
+    def __init__(self, loss_weight=1.0, reduction="mean", eps=1e-12):
+        super(CharbonnierLoss, self).__init__()
+        if reduction not in ["none", "mean", "sum"]:
+            raise ValueError(
+                f"Unsupported reduction mode: {reduction}. "
+                f"Supported ones are: {_reduction_modes}"
+            )
+
+        self.loss_weight = loss_weight
+        self.reduction = reduction
+        self.eps = eps
+
+    def forward(self, pred, target, weight=None, **kwargs):
+        """
+        Args:
+            pred (Tensor): of shape (N, C, H, W). Predicted tensor.
+            target (Tensor): of shape (N, C, H, W). Ground truth tensor.
+            weight (Tensor, optional): of shape (N, C, H, W). Element-wise
+                weights. Default: None.
+        """
+        return self.loss_weight * charbonnier_loss(
+            pred, target, weight, eps=self.eps, reduction=self.reduction
+        )
 
 
 class VGGLoss(nn.Module):
-    def __init__(self, loss_weight=0.2, reduction="mean", criterion="l1"):
-        super().__init__()
-        vgg = torchvision.models.vgg19(
+    """Combined VGG19 feature extractor and perceptual loss"""
+
+    def __init__(self, loss_weight=1.0, criterion="l1", reduction="mean"):
+        super(VGGLoss, self).__init__()
+
+        # Initialize VGG19 feature extractor
+        vgg_pretrained_features = torchvision.models.vgg19(
             weights=torchvision.models.VGG19_Weights.IMAGENET1K_V1
         ).features
-        self.layers = nn.ModuleList([vgg[:3], vgg[3:8], vgg[8:13]])
-        for p in self.parameters():
-            p.requires_grad_(False)
-        self.eval()
-        self.w = loss_weight
-        self.reduction = reduction
-        self.crit = F.l1_loss if criterion == "l1" else F.mse_loss
-        m = torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1)
-        s = torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1)
-        self.register_buffer("mean", m)
-        self.register_buffer("std", s)
 
-    def _norm(self, x):
-        return (x - self.mean) / self.std
+        # Create feature slices
+        self.slice1 = torch.nn.Sequential()
+        self.slice2 = torch.nn.Sequential()
+        self.slice3 = torch.nn.Sequential()
+        self.slice4 = torch.nn.Sequential()
+        self.slice5 = torch.nn.Sequential()
 
-    @torch.no_grad()
-    def _feat(self, x):
-        x = self._norm(x)
-        feats = []
-        h = x
-        for block in self.layers:
-            h = block(h)
-            feats.append(h)
-        return feats
+        for x in range(2):
+            self.slice1.add_module(str(x), vgg_pretrained_features[x])
+        for x in range(2, 7):
+            self.slice2.add_module(str(x), vgg_pretrained_features[x])
+        for x in range(7, 12):
+            self.slice3.add_module(str(x), vgg_pretrained_features[x])
+        for x in range(12, 21):
+            self.slice4.add_module(str(x), vgg_pretrained_features[x])
+        for x in range(21, 30):
+            self.slice5.add_module(str(x), vgg_pretrained_features[x])
 
-    def forward(self, pred, target):
-        f_p = self._feat(pred.clamp(0, 1))
-        f_t = self._feat(target.clamp(0, 1))
+        # Don't freeze parameters - let them be part of the loss computation
+        # but they won't be updated during training since VGGLoss is not part of model
+
+        del vgg_pretrained_features
+
+        # Loss configuration
+        if reduction not in ["none", "mean", "sum"]:
+            raise ValueError(
+                f"Unsupported reduction mode: {reduction}. "
+                f"Supported ones are: {_reduction_modes}"
+            )
+
+        if criterion == "l1":
+            self.criterion = nn.L1Loss(reduction=reduction)
+        elif criterion == "l2":
+            self.criterion = nn.MSELoss(reduction=reduction)
+        else:
+            raise NotImplementedError("Unsupported criterion loss")
+
+        # Feature weights for multi-scale loss
+        self.weights = [1.0 / 32, 1.0 / 16, 1.0 / 8, 1.0 / 4, 1.0]
+        self.loss_weight = loss_weight
+
+        # Move to GPU if available
+        if torch.cuda.is_available():
+            self.cuda()
+
+    def extract_features(self, x):
+        """Extract VGG19 features from input tensor"""
+        h_relu1 = self.slice1(x)
+        h_relu2 = self.slice2(h_relu1)
+        h_relu3 = self.slice3(h_relu2)
+        h_relu4 = self.slice4(h_relu3)
+        h_relu5 = self.slice5(h_relu4)
+        return [h_relu1, h_relu2, h_relu3, h_relu4, h_relu5]
+
+    def forward(self, x, y):
+        """Compute perceptual loss between x and y"""
+        x_features = self.extract_features(x)
+        y_features = self.extract_features(y)
+
         loss = 0
-        for a, b in zip(f_p, f_t):
-            loss = loss + self.crit(a, b, reduction=self.reduction)
-        return self.w * loss
+        for i in range(len(x_features)):
+            loss += self.weights[i] * self.criterion(
+                x_features[i], y_features[i].detach()
+            )
+
+        return self.loss_weight * loss
+
+
+class EdgeLoss(nn.Module):
+    def __init__(self, loss_weight=1.0, criterion="l2", reduction="mean"):
+        super(EdgeLoss, self).__init__()
+        if reduction not in ["none", "mean", "sum"]:
+            raise ValueError(
+                f"Unsupported reduction mode: {reduction}. "
+                f"Supported ones are: {_reduction_modes}"
+            )
+
+        if criterion == "l1":
+            self.criterion = nn.L1Loss(reduction=reduction)
+        elif criterion == "l2":
+            self.criterion = nn.MSELoss(reduction=reduction)
+        else:
+            raise NotImplementedError("Unsupported criterion loss")
+
+        k = torch.Tensor([[0.05, 0.25, 0.4, 0.25, 0.05]])
+        self.kernel = torch.matmul(k.t(), k).unsqueeze(0).repeat(3, 1, 1, 1)
+
+        self.weight = loss_weight
+
+    def conv_gauss(self, img):
+        n_channels, _, kw, kh = self.kernel.shape
+        img = F.pad(img, (kw // 2, kh // 2, kw // 2, kh // 2), mode="replicate")
+        return F.conv2d(img, self.kernel.to(img.device), groups=n_channels)
+
+    def laplacian_kernel(self, current):
+        filtered = self.conv_gauss(current)
+        down = filtered[:, :, ::2, ::2]
+        new_filter = torch.zeros_like(filtered)
+        new_filter[:, :, ::2, ::2] = down * 4
+        filtered = self.conv_gauss(new_filter)
+        diff = current - filtered
+        return diff
+
+    def forward(self, x, y):
+        loss = self.criterion(self.laplacian_kernel(x), self.laplacian_kernel(y))
+        return loss * self.weight
+
+
+def SSIM_loss(pred_img, real_img, data_range):
+    loss = pytorch_msssim.ssim(pred_img, real_img, data_range=data_range)
+    return loss
+
+
+class SSIM(nn.Module):
+    def __init__(self, loss_weight=1.0, data_range=1.0):
+        super(SSIM, self).__init__()
+        self.loss_weight = loss_weight
+        self.data_range = data_range
+
+    def forward(self, pred, target, **kwargs):
+        return self.loss_weight * SSIM_loss(pred, target, self.data_range)
+
+
+class SSIMloss(nn.Module):
+    def __init__(self, loss_weight=1.0, data_range=1.0):
+        super(SSIMloss, self).__init__()
+        self.loss_weight = loss_weight
+        self.data_range = data_range
+
+    def forward(self, pred, target, **kwargs):
+        return self.loss_weight * (1 - SSIM_loss(pred, target, self.data_range))
 
 
 class LowLightLoss(nn.Module):
-    def __init__(self, loss_weights: Dict, device):
-        super().__init__()
-        w = lambda k, d: loss_weights.get(k, d)
-        self.charb = charbonnier_loss
-        self.w_charb = w("charbonnier", 1.0)
+    """Combined loss for Low Light Image Enhancement"""
 
-        self.chroma = ChromaLoss(
-            loss_weight=w("chroma", 1.0),
-            reduction=loss_weights.get("chroma_reduction", "mean"),
-            criterion=loss_weights.get("chroma_criterion", "l1"),
-        ).to(device)
+    def __init__(self, loss_weights: Dict, **kwargs):
+        super(LowLightLoss, self).__init__()
+        self.weights = loss_weights
 
-        self.edge = EdgeLoss(
-            loss_weight=w("edge", 0.5),
-            reduction=loss_weights.get("edge_reduction", "mean"),
-            criterion=loss_weights.get("edge_criterion", "l1"),
-        ).to(device)
-
-        self.hfreq = HighFreqLoss(
-            loss_weight=w("frequency", 0.5),
-            reduction=loss_weights.get("frequency_reduction", "mean"),
-            criterion=loss_weights.get("frequency_criterion", "l1"),
-        ).to(device)
-
-        self.vgg = VGGLoss(
-            loss_weight=w("perceptual", 0.2),
+        self.charbonnier_loss = CharbonnierLoss(
+            loss_weight=loss_weights.get("charbonnier", 1),
+            reduction=loss_weights.get("charbonnier_reduction", "mean"),
+        )
+        self.perceptual_loss = VGGLoss(
+            criterion=loss_weights.get("perceptual_criterion", "l2"),
             reduction=loss_weights.get("perceptual_reduction", "mean"),
-            criterion=loss_weights.get("perceptual_criterion", "l1"),
-        ).to(device)
-
-        self.device = device
+            loss_weight=loss_weights.get("perceptual", 1),
+        )
+        self.edge_loss = EdgeLoss(
+            loss_weight=loss_weights.get("edge", 1),
+            criterion=loss_weights.get("edge_criterion", "l2"),
+            reduction=loss_weights.get("edge_reduction", "mean"),
+        )
+        self.frequency_loss = FrequencyLoss(
+            loss_weight=loss_weights.get("frequency", 1),
+            reduction=loss_weights.get("frequency_reduction", "mean"),
+            criterion=loss_weights.get("frequency_criterion", "l2"),
+        )
 
     def forward(self, pred, target):
-        pred = pred.clamp(0, 1)
-        target = target.clamp(0, 1)
+        total_loss = 0
+        charbonnier_loss = self.charbonnier_loss(pred, target)
+        perceptual_loss = self.perceptual_loss(pred, target)
+        edge_loss = self.edge_loss(pred, target)
+        frequency_loss = self.frequency_loss(pred, target)
 
-        Lc = self.w_charb * self.charb(pred, target, reduction="mean")
-        Lchroma = self.chroma(pred, target)
-        Le = self.edge(pred, target)
-        Lhf = self.hfreq(pred, target)
-        Lp = self.vgg(pred, target)
-
-        total = Lc + Lchroma + Le + Lhf + Lp
-
+        total_loss = charbonnier_loss + perceptual_loss + edge_loss + frequency_loss
         return {
-            "total": total,
-            "charbonnier": Lc.detach(),
-            "chroma": Lchroma.detach(),
-            "edge": Le.detach(),
-            "frequency": Lhf.detach(),
-            "perceptual": Lp.detach(),
+            "total": total_loss,
+            "charbonnier": charbonnier_loss,
+            "perceptual": perceptual_loss,
+            "edge": edge_loss,
+            "frequency": frequency_loss,
         }
