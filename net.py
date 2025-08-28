@@ -14,11 +14,16 @@ class IlluminationExtractionModule(nn.Module):
     def __init__(self, channels):
         super(IlluminationExtractionModule, self).__init__()
         self.conv = nn.Conv2d(channels, channels, kernel_size=3, padding=1, bias=False)
-        # Keep sigmoid for illumination maps to maintain proper range [0,1]
-        self.sigmoid = nn.Sigmoid()
+        # Use ReLU6 for sharper activation instead of sigmoid
+        self.activation = nn.ReLU6()
+        # Add batch norm for better training stability
+        self.bn = nn.BatchNorm2d(channels)
 
     def forward(self, x):
-        illumination_map = self.sigmoid(self.conv(x))
+        # Apply convolution and batch norm
+        out = self.bn(self.conv(x))
+        # Use ReLU6 for sharper, more defined illumination maps
+        illumination_map = self.activation(out)
         return illumination_map
 
 
@@ -26,11 +31,16 @@ class NoiseEstimationModule(nn.Module):
     def __init__(self, channels):
         super(NoiseEstimationModule, self).__init__()
         self.conv = nn.Conv2d(channels, channels, kernel_size=3, padding=1, bias=False)
-        # Keep sigmoid for noise maps to maintain proper range [0,1]
-        self.sigmoid = nn.Sigmoid()
+        # Use ReLU6 for sharper activation instead of sigmoid
+        self.activation = nn.ReLU6()
+        # Add batch norm for better training stability
+        self.bn = nn.BatchNorm2d(channels)
 
     def forward(self, x):
-        out = self.sigmoid(self.conv(x))
+        # Apply convolution and batch norm
+        out = self.bn(self.conv(x))
+        # Use ReLU6 for sharper, more defined noise maps
+        out = self.activation(out)
         return out
 
 
@@ -49,8 +59,12 @@ class IlluminationAwareGate(nn.Module):
         )
         self.act = nn.GELU()
         self.conv_pw = nn.Conv1d(1, 1, kernel_size=1, bias=False)
-        # Use ReLU instead of sigmoid for sharper activation
-        self.activation = nn.ReLU(inplace=True)
+        # Use LeakyReLU for sharper activation and better gradient flow
+        self.activation = nn.LeakyReLU(negative_slope=0.1, inplace=True)
+        # Add edge-preserving mechanism
+        self.edge_conv = nn.Conv2d(
+            channels, channels, kernel_size=3, padding=1, bias=False
+        )
 
     def kernel_size(self):
         k = int(abs((math.log2(self.channels) / self.gamma) + self.b / self.gamma))
@@ -69,10 +83,18 @@ class IlluminationAwareGate(nn.Module):
         y = self.act(y)
         y = self.conv_pw(y)
         y = y.transpose(-1, -2).unsqueeze(-1)
-        # Use ReLU and add residual connection
+        # Use LeakyReLU for sharper activation
         y = self.activation(y)
-        # Add residual connection to preserve original features
-        out = x * (0.5 + 0.5 * y.expand_as(x))
+
+        # Add edge-preserving mechanism
+        edge_features = self.edge_conv(x)
+        edge_weight = torch.sigmoid(edge_features.mean(dim=1, keepdim=True))
+
+        # Combine illumination-aware gating with edge preservation
+        gate_weight = 0.5 + 0.5 * y.expand_as(x)
+        final_weight = gate_weight * (1.0 + 0.1 * edge_weight)
+
+        out = x * final_weight
         return out
 
 
@@ -257,6 +279,31 @@ class RestorationEnhancementAttention(nn.Module):
         return x
 
 
+class EdgeEnhancementModule(nn.Module):
+    """Module to enhance edges and reduce blurry effects"""
+
+    def __init__(self, channels):
+        super(EdgeEnhancementModule, self).__init__()
+        self.edge_conv1 = nn.Conv2d(
+            channels, channels, kernel_size=3, padding=1, bias=False
+        )
+        self.edge_conv2 = nn.Conv2d(
+            channels, channels, kernel_size=3, padding=1, bias=False
+        )
+        self.bn1 = nn.BatchNorm2d(channels)
+        self.bn2 = nn.BatchNorm2d(channels)
+        self.activation = nn.ReLU(inplace=True)
+
+    def forward(self, x):
+        # Extract edge features
+        edge1 = self.activation(self.bn1(self.edge_conv1(x)))
+        edge2 = self.activation(self.bn2(self.edge_conv2(edge1)))
+
+        # Enhance edges by adding edge information back
+        enhanced = x + 0.1 * edge2
+        return enhanced
+
+
 class LIENet(nn.Module):
     def __init__(
         self,
@@ -330,6 +377,9 @@ class LIENet(nn.Module):
             ]
         )
 
+        # Add edge enhancement module before output
+        self.edge_enhancement = EdgeEnhancementModule(channels[0])
+
         self.out_conv = nn.Conv2d(channels[0], 3, kernel_size=3, padding=1, bias=False)
 
     def forward(self, x):
@@ -355,6 +405,8 @@ class LIENet(nn.Module):
             fo = self.decoders[i](fo)
 
         fr = self.refinement(fo)
+        # Apply edge enhancement before final output
+        fr = self.edge_enhancement(fr)
         output = self.out_conv(fr)
 
         return output

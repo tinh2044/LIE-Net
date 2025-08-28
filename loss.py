@@ -458,28 +458,38 @@ class LowLightLoss(nn.Module):
             loss_weight=loss_weights.get("perceptual", 1),
         )
         self.edge_loss = EdgeLoss(
-            loss_weight=loss_weights.get("edge", 1),
+            loss_weight=loss_weights.get("edge", 2),  # Increased edge loss weight
             criterion=loss_weights.get("edge_criterion", "l2"),
             reduction=loss_weights.get("edge_reduction", "mean"),
         )
         self.frequency_loss = FrequencyLoss(
-            loss_weight=loss_weights.get("frequency", 1),
+            loss_weight=loss_weights.get(
+                "frequency", 1.5
+            ),  # Increased frequency loss weight
             reduction=loss_weights.get("frequency_reduction", "mean"),
             criterion=loss_weights.get("frequency_criterion", "l2"),
         )
+        # Add L1 loss for better edge preservation
+        self.l1_loss = L1Loss(
+            loss_weight=loss_weights.get("l1", 0.5),
+            reduction=loss_weights.get("l1_reduction", "mean"),
+        )
 
     def forward(self, pred, target):
-        total_loss = 0
         charbonnier_loss = self.charbonnier_loss(pred, target)
         perceptual_loss = self.perceptual_loss(pred, target)
         edge_loss = self.edge_loss(pred, target)
         frequency_loss = self.frequency_loss(pred, target)
+        l1_loss = self.l1_loss(pred, target)
 
-        total_loss = charbonnier_loss + perceptual_loss + edge_loss + frequency_loss
+        total_loss = (
+            charbonnier_loss + perceptual_loss + edge_loss + frequency_loss + l1_loss
+        )
         return {
             "total": total_loss,
             "charbonnier": charbonnier_loss,
             "perceptual": perceptual_loss,
             "edge": edge_loss,
             "frequency": frequency_loss,
+            "l1": l1_loss,
         }

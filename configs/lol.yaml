@@ -17,12 +17,13 @@ model:
   loss:
     charbonnier: 1.0
     chroma: 1.0
-    edge: 1.0
-    frequency: 1.0
+    edge: 2.0  # Increased for better edge preservation
+    frequency: 1.5  # Increased for better detail preservation
     perceptual: 0.2
+    l1: 0.5  # Added L1 loss for edge preservation
 
 training:
-  model_dir: "./datasets_LOL"
+  model_dir: "./outputs_LOL"
   learning_rate: 1e-3
   weight_decay: 2e-5
   warmup_epochs: 0
