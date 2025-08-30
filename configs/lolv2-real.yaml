@@ -1,12 +1,10 @@
 data:
-  root: "./datasets/LOLv2-real/"
+  root: "./datasets/LOL/"
   train_dir: "train"
   test_dir: "test"
   input_dir: "low"
   target_dir: "light"  
   image_size: 256
-  batch_size: 4
-  num_workers: 4
   max_len: 1  
 
 model:
@@ -16,24 +14,19 @@ model:
   num_refinement: 4
   expansion_factor: 2.66
   ch: [16, 16, 32, 64]
-
-  loss_weights:
+  loss:
     charbonnier: 1.0
-    perceptual: 0.5
-    smoothness: 0.2
-    exposure: 0.3
-    noise_aware: 0.6
-  
+    chroma: 1.0
+    edge: 2.0  # Increased for better edge preservation
+    frequency: 1.5  # Increased for better detail preservation
+    perceptual: 0.2
+    l1: 0.5  # Added L1 loss for edge preservation
 
 training:
-  model_dir: "./outputs/LOL/"
-  epochs: 800
-  batch_size: 4
+  model_dir: "./outputs_LOLv2"
   learning_rate: 1e-3
   weight_decay: 2e-5
-  warmup_epochs: 10
-  save_freq: 10
-  eval_freq: 5
+  warmup_epochs: 0
   print_freq: 100
   
   optimization:
