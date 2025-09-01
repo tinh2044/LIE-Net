@@ -285,7 +285,7 @@ def main(args, cfg):
         # Save checkpoint
         checkpoint_paths = [output_dir / f"checkpoint_{epoch}.pth"]
         prev_chkpt = output_dir / f"checkpoint_{epoch - 1}.pth"
-        if os.path.exists(prev_chkpt):
+        if os.path.exists(prev_chkpt) and local_rank == 0:
             os.remove(prev_chkpt)
         for checkpoint_path in checkpoint_paths:
             utils.save_on_master(
