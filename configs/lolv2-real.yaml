@@ -18,7 +18,7 @@ model:
     charbonnier: 1.0
     chroma: 1.0
     edge: 2.0  # keep moderate edge emphasis
-    frequency: 0.1  # reduced; stronger FFT norm will scale it
+    frequency: 0.0  # reduced; stronger FFT norm will scale it
     perceptual: 0.1  # reduced to avoid dominating optimization
     l1: 1.0  # stronger pixel constraint for PSNR stability
 
