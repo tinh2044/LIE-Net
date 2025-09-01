@@ -90,47 +90,31 @@ def save_on_master(*args, **kwargs):
         torch.save(*args, **kwargs)
 
 
-def init_distributed_mode(args):
+def setup_distributed():
     """Initialize distributed training"""
-    if "RANK" in os.environ and "WORLD_SIZE" in os.environ:
-        args.rank = int(os.environ["RANK"])
-        args.world_size = int(os.environ["WORLD_SIZE"])
-        args.gpu = int(os.environ["LOCAL_RANK"])
-    elif "SLURM_PROCID" in os.environ:
-        args.rank = int(os.environ["SLURM_PROCID"])
-        args.gpu = args.rank % torch.cuda.device_count()
+    if "WORLD_SIZE" in os.environ:
+        world_size = int(os.environ["WORLD_SIZE"])
+        rank = int(os.environ["RANK"])
+        local_rank = int(os.environ["LOCAL_RANK"])
+
+        print(
+            f"Setting up distributed training: rank={rank}, local_rank={local_rank}, world_size={world_size}"
+        )
+
+        # Initialize the process group
+        dist.init_process_group(backend="nccl")
+
+        # Set the device for this process
+        torch.cuda.set_device(local_rank)
+
+        return True, rank, local_rank, world_size
     else:
-        print("Not using distributed mode")
-        args.distributed = False
-        return
-
-    args.distributed = True
-
-    torch.cuda.set_device(args.gpu)
-    args.dist_backend = "nccl"
-    print(f"| distributed init (rank {args.rank}): {args.dist_url}", flush=True)
-    torch.distributed.init_process_group(
-        backend=args.dist_backend,
-        init_method=args.dist_url,
-        world_size=args.world_size,
-        rank=args.rank,
-    )
-    torch.distributed.barrier()
-    setup_for_distributed(args.rank == 0)
+        return False, 0, 0, 1
 
 
-def setup_for_distributed(is_master):
-    """Setup for distributed training"""
-    import builtins as __builtin__
-
-    builtin_print = __builtin__.print
-
-    def print(*args, **kwargs):
-        force = kwargs.pop("force", False)
-        if is_master or force:
-            builtin_print(*args, **kwargs)
-
-    __builtin__.print = print
+def cleanup_distributed():
+    if dist.is_initialized():
+        dist.destroy_process_group()
 
 
 def check_state_dict(model, state_dict):

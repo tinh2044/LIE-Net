@@ -227,6 +227,20 @@ class MetricLogger(object):
 
 class Logger:
     def __init__(self, log_dir="logs", file_name=""):
+        # Determine if we're in distributed mode and whether this is the main process
+        is_ddp = is_dist_avail_and_initialized()
+        current_rank = dist.get_rank() if is_ddp else 0
+        is_main_process = current_rank == 0
+
+        # If no log_dir is provided on non-main ranks, avoid any filesystem or logger reconfiguration
+        if log_dir is None and not is_main_process:
+            self.log_file = None
+            return
+
+        # Default the log directory if None on main process
+        if log_dir is None:
+            log_dir = "logs"
+
         os.makedirs(log_dir, exist_ok=True)
 
         if file_name:
@@ -235,20 +249,22 @@ class Logger:
             timestamp = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
             self.log_file = os.path.join(log_dir, f"log_{timestamp}.log")
 
-        logger.remove()
-
-        logger.add(
-            sys.stdout,
-            format="<green>{time:YYYY-MM-DD HH:mm:ss}</green> | {message}",
-            level="INFO",
-            colorize=True,
-        )
-        logger.add(
-            self.log_file,
-            format="{time:YYYY-MM-DD HH:mm:ss} | {message}",
-            level="INFO",
-            rotation="10MB",
-        )
+        # Configure loguru sinks only once per process
+        if not getattr(Logger, "_configured", False):
+            logger.remove()
+            logger.add(
+                sys.stdout,
+                format="<green>{time:YYYY-MM-DD HH:mm:ss}</green> | {message}",
+                level="INFO",
+                colorize=True,
+            )
+            logger.add(
+                self.log_file,
+                format="{time:YYYY-MM-DD HH:mm:ss} | {message}",
+                level="INFO",
+                rotation="10MB",
+            )
+            Logger._configured = True
 
         logger.info(f"Logging to {self.log_file}")
 

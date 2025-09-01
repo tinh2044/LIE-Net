@@ -1,6 +1,8 @@
 import torch
 import torch.backends.cudnn as cudnn
+from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader
+from torch.utils.data.distributed import DistributedSampler
 import os
 import time
 import argparse
@@ -67,7 +69,25 @@ def main(args, cfg):
 
     device = torch.device(args.device if torch.cuda.is_available() else "cpu")
 
-    utils.init_distributed_mode(args)
+    is_distributed, rank, local_rank, world_size = utils.setup_distributed()
+
+    if rank != 0:
+        logger.remove()
+        logger.add(lambda msg: None)
+
+    model_dir = cfg.get("training", {}).get("model_dir", "outputs/islr_model")
+    log_dir = f"{model_dir}/log"
+
+    if is_distributed:
+        device = torch.device(f"cuda:{local_rank}")
+    else:
+        device = (
+            torch.device(args.device)
+            if args.device and (args.device.startswith("cuda") or args.device == "cpu")
+            else torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        )
+
+    args.device = device
 
     seed = args.seed + utils.get_rank()
     # Set seed
@@ -81,12 +101,21 @@ def main(args, cfg):
     train_data = get_training_set(cfg_data["root"], cfg_data)
     test_data = get_test_set(cfg_data["root"], cfg_data)
 
+    train_sampler = None
+    test_sampler = None
+    if is_distributed:
+        train_sampler = DistributedSampler(train_data, shuffle=True)
+        test_sampler = DistributedSampler(test_data, shuffle=False)
+
     train_dataloader = DataLoader(
         train_data,
         batch_size=args.batch_size,
         num_workers=args.num_workers,
-        collate_fn=train_data.data_collator,
-        shuffle=True,
+        collate_fn=train_data.data_collator
+        if hasattr(train_data, "data_collator")
+        else None,
+        shuffle=(train_sampler is None),
+        sampler=train_sampler,
         pin_memory=True,
         drop_last=True,
     )
@@ -95,7 +124,10 @@ def main(args, cfg):
         test_data,
         batch_size=args.batch_size,
         num_workers=args.num_workers,
-        collate_fn=test_data.data_collator,
+        collate_fn=test_data.data_collator
+        if hasattr(test_data, "data_collator")
+        else None,
+        sampler=test_sampler,
         pin_memory=True,
     )
 
@@ -104,52 +136,64 @@ def main(args, cfg):
     model = model.to(device)
     n_parameters = utils.count_model_parameters(model)
 
+    if is_distributed:
+        model = DDP(model, device_ids=[local_rank], output_device=local_rank)
+        model_for_params = model.module
+    else:
+        model_for_params = model
+
+    n_parameters = utils.count_model_parameters(model_for_params)
+
     # Create loss function
     loss_weights = cfg["model"]["loss"]
     loss_fn = LowLightLoss(loss_weights, device=device)
     print(f"Number of parameters: {n_parameters}")
 
     # Calculate model info
-    input_shape = (args.batch_size, 3, cfg_data["image_size"], cfg_data["image_size"])
-    model_info = utils.get_model_info(model, input_shape, device)
 
-    print("Model Information:")
-    print(f"  Total parameters: {model_info['total_params']:,}")
-    print(f"  Trainable parameters: {model_info['trainable_params']:,}")
-    print(f"  Non-trainable parameters: {model_info['non_trainable_params']:,}")
+    if rank == 0:
+        print(f"Number of parameters: {n_parameters}")
 
-    if "flops" in model_info:
-        print(f"  FLOPs: {model_info['flops_str']}")
-        print(f"  MACs: {model_info['macs_str']}")
-        print(f"  Parameters (from thop): {model_info['params_str']}")
-    print()
+        input_shape = (
+            args.batch_size,
+            3,
+            cfg_data["image_size"],
+            cfg_data["image_size"],
+        )
+        model_info = utils.get_model_info(model_for_params, input_shape, device)
 
-    # Load pretrained model if specified
-    if args.finetune:
-        print(f"Finetuning from {args.finetune}")
-        checkpoint = torch.load(args.finetune, map_location="cpu")
-        ret = model.load_state_dict(checkpoint["model_state_dict"], strict=False)
-        print("Missing keys: \n", "\n".join(ret.missing_keys))
-        print("Unexpected keys: \n", "\n".join(ret.unexpected_keys))
+        print("Model Information:")
+        print(f"  Total parameters: {model_info['total_params']:,}")
+        print(f"  Trainable parameters: {model_info['trainable_params']:,}")
+        print(f"  Non-trainable parameters: {model_info['non_trainable_params']:,}")
 
-    # Create optimizer and scheduler
-    optimizer = build_optimizer(config=cfg["training"]["optimization"], model=model)
+        if "flops" in model_info:
+            print(f"  FLOPs: {model_info['flops_str']}")
+            print(f"  MACs: {model_info['macs_str']}")
+            print(f"  Parameters (from thop): {model_info['params_str']}")
+        print()
+    optimizer_config = cfg.get("training", {}).get("optimization", {})
+    optimizer = build_optimizer(config=optimizer_config, model=model_for_params)
 
-    # Set initial_lr for optimizer (needed for scheduler resume)
     for group in optimizer.param_groups:
         if "initial_lr" not in group:
             group["initial_lr"] = group["lr"]
 
-    # Update config with total epochs for warmup scheduler
+    if "training" not in cfg:
+        cfg["training"] = {}
+    if "optimization" not in cfg["training"]:
+        cfg["training"]["optimization"] = {}
     cfg["training"]["optimization"]["total_epochs"] = args.epochs
 
-    # Initialize scheduler with correct last_epoch for resume
     scheduler_last_epoch = -1
     if args.resume:
-        print(f"Resume training from {args.resume}")
+        if rank == 0:
+            print(f"Resume training from {args.resume}")
         checkpoint = torch.load(args.resume, map_location="cpu")
-        if utils.check_state_dict(model, checkpoint["model_state_dict"]):
-            ret = model.load_state_dict(checkpoint["model_state_dict"], strict=False)
+        if utils.check_state_dict(model_for_params, checkpoint["model_state_dict"]):
+            ret = model_for_params.load_state_dict(
+                checkpoint["model_state_dict"], strict=False
+            )
         else:
             print("Model and state dict are different")
             raise ValueError("Model and state dict are different")
@@ -157,28 +201,35 @@ def main(args, cfg):
         if "epoch" in checkpoint:
             scheduler_last_epoch = checkpoint["epoch"]
         args.start_epoch = checkpoint["epoch"] + 1
-        print("Missing keys: \n", "\n".join(ret.missing_keys))
-        print("Unexpected keys: \n", "\n".join(ret.unexpected_keys))
-    cfg["training"]["optimization"]["scheduler"]["T_max"] = args.epochs
-    # Create scheduler with correct last_epoch
+        if rank == 0:
+            print("Missing keys: \n", "\n".join(ret.missing_keys))
+            print("Unexpected keys: \n", "\n".join(ret.unexpected_keys))
+
     scheduler, scheduler_type = build_scheduler(
         config=cfg["training"]["optimization"],
         optimizer=optimizer,
         last_epoch=scheduler_last_epoch,
     )
 
-    # Load optimizer and scheduler state if resuming
     if args.resume:
         if (
             not args.eval
             and "optimizer_state_dict" in checkpoint
             and "scheduler_state_dict" in checkpoint
         ):
-            print("Loading optimizer and scheduler")
+            if rank == 0:
+                print("Loading optimizer and scheduler")
             optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
             if hasattr(scheduler, "load_state_dict"):
                 scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
-            print(f"New learning rate : {scheduler.get_last_lr()[0]}")
+            if rank == 0:
+                print(f"New learning rate : {scheduler.get_last_lr()[0]}")
+
+    args.output_dir = model_dir
+    args.save_images = cfg.get("evaluation", {}).get("save_images", False)
+    args.save_samples = args.save_samples
+
+    output_dir = Path(model_dir)
 
     # Add loss function and output directory to args
     args.output_dir = model_dir
@@ -202,20 +253,24 @@ def main(args, cfg):
             results_path=f"{model_dir}/test_results.json",
             log_dir=f"{log_dir}/eval/test",
         )
-        print(
-            f"Test loss of the network on the {len(test_dataloader)} test images: {test_results['psnr']:.3f} PSNR"
-        )
-        print(f"* TEST SSIM {test_results['ssim']:.3f}")
+        if rank == 0:
+            print(
+                f"Test loss of the network on the {len(test_dataloader)} test images: {test_results['psnr']:.3f} PSNR"
+            )
+            print(f"* TEST SSIM {test_results['ssim']:.3f}")
         return
 
-    print(f"Training on {device}")
-    print(
-        f"Start training for {args.epochs} epochs and start epoch: {args.start_epoch}"
-    )
+    if rank == 0:
+        print(f"Training on {device}")
+        print(
+            f"Start training for {args.epochs} epochs and start epoch: {args.start_epoch}"
+        )
     start_time = time.time()
     best_psnr = 0.0
 
     for epoch in range(args.start_epoch, args.epochs):
+        if rank == 0:
+            logger.info(f"Epoch {epoch} of {args.epochs}")
         train_results = train_one_epoch(
             args,
             model,
@@ -270,8 +325,8 @@ def main(args, cfg):
                     },
                     checkpoint_path,
                 )
-
-        print(f"* TEST PSNR {test_results['psnr']:.3f} Best PSNR {best_psnr:.3f}")
+        if rank == 0:
+            print(f"* TEST PSNR {test_results['psnr']:.3f} Best PSNR {best_psnr:.3f}")
 
         # Log results
         log_results = {
@@ -283,10 +338,11 @@ def main(args, cfg):
         print()
         with (output_dir / "log.txt").open("a") as f:
             f.write(json.dumps(log_results) + "\n")
-
-    total_time = time.time() - start_time
-    total_time_str = str(datetime.timedelta(seconds=int(total_time)))
-    print("Training time {}".format(total_time_str))
+    if rank == 0:
+        total_time = time.time() - start_time
+        total_time_str = str(datetime.timedelta(seconds=int(total_time)))
+        print("Training time {}".format(total_time_str))
+    utils.cleanup_distributed()
 
 
 if __name__ == "__main__":
