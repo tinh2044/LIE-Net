@@ -10,7 +10,6 @@ def train_one_epoch(
     model,
     data_loader,
     optimizer,
-    scheduler,
     epoch,
     loss_fn,
     print_freq=10,
@@ -44,7 +43,6 @@ def train_one_epoch(
         optimizer.zero_grad()
         total_loss.backward()
         optimizer.step()
-        scheduler.step()
 
         # Update metrics
         for loss_name, loss_value in loss_dict.items():

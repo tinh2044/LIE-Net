@@ -159,7 +159,7 @@ def main(args, cfg):
         args.start_epoch = checkpoint["epoch"] + 1
         print("Missing keys: \n", "\n".join(ret.missing_keys))
         print("Unexpected keys: \n", "\n".join(ret.unexpected_keys))
-
+    cfg["training"]["optimization"]["scheduler"]["T_max"] = args.epochs
     # Create scheduler with correct last_epoch
     scheduler, scheduler_type = build_scheduler(
         config=cfg["training"]["optimization"],
@@ -221,7 +221,6 @@ def main(args, cfg):
             model,
             train_dataloader,
             optimizer,
-            scheduler,
             epoch,
             loss_fn,
             print_freq=args.print_freq,
