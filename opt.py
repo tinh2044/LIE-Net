@@ -22,10 +22,6 @@ def train_one_epoch(
     metric_logger.add_meter("lr", SmoothedValue(window_size=1, fmt="{value:.6f}"))
     header = f"Train epoch: [{epoch}]"
 
-    # Update learning rate
-    for param_group in optimizer.param_groups:
-        metric_logger.update(lr=param_group["lr"])
-
     for batch_idx, batch in enumerate(
         metric_logger.log_every(data_loader, print_freq, header)
     ):
