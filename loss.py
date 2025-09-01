@@ -284,8 +284,8 @@ class VGGLoss(nn.Module):
         for x in range(21, 30):
             self.slice5.add_module(str(x), vgg_pretrained_features[x])
 
-        # Don't freeze parameters - let them be part of the loss computation
-        # but they won't be updated during training since VGGLoss is not part of model
+        for param in self.parameters():
+            param.requires_grad = False
 
         del vgg_pretrained_features
 

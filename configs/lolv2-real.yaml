@@ -15,13 +15,10 @@ model:
   expansion_factor: 2.66
   ch: [16, 16, 32, 64]
   loss:
-    charbonnier: 1.0
-    chroma: 1.0
-    edge: 2.0  # keep moderate edge emphasis
-    frequency: 0.0  # disable since it destabilized training
-    perceptual: 0.1  # reduced to avoid dominating optimization
-    ssim: 0.1  # structural constraint to improve PSNR/SSIM stability
-    grad: 1.0  # gradient constraint to improve edge preservation
+    charbonnier: 2.0  
+    perceptual: 0.02  
+    ssim: 0.1
+    grad: 0.2         
 
 training:
   model_dir: "./outputs_LOLv2"
