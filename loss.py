@@ -423,9 +423,7 @@ class LowLightLoss(nn.Module):
         ssim_loss = self.ssim_loss(pred, target)
         grad_loss = self.grad(pred, target)
 
-        total_loss = (
-            charbonnier_loss + perceptual_loss + grad_loss + l1_loss + ssim_loss
-        )
+        total_loss = charbonnier_loss + perceptual_loss + grad_loss + ssim_loss
         return {
             "total": total_loss,
             "charbonnier": charbonnier_loss,
