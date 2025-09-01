@@ -89,9 +89,9 @@ class IlluminationAwareGate(nn.Module):
         edge_features = self.edge_conv(x)
         edge_weight = torch.sigmoid(edge_features.mean(dim=1, keepdim=True))
 
-        # Combine illumination-aware gating with edge preservation
-        gate_weight = 0.5 + 0.5 * y.expand_as(x)
-        final_weight = gate_weight * (1.0 + 0.1 * edge_weight)
+        # Combine illumination-aware gating with edge preservation (tamed)
+        gate_weight = torch.sigmoid(y).expand_as(x)
+        final_weight = gate_weight * (1.0 + 0.05 * edge_weight)
 
         out = x * final_weight
         return out
@@ -171,15 +171,24 @@ class IlluminationGuidedAttention(nn.Module):
         kw = to_windows(k)
         vw = to_windows(v)
 
-        illum_w = scalar_to_windows(illum_scalar)
-        noise_w = scalar_to_windows(noise_scalar)
+        # Stabilize priors via per-batch z-score and sigmoid
+        eps = 1e-6
+        mu_i = illum_scalar.mean(dim=(2, 3), keepdim=True)
+        sd_i = illum_scalar.std(dim=(2, 3), keepdim=True) + eps
+        mu_n = noise_scalar.mean(dim=(2, 3), keepdim=True)
+        sd_n = noise_scalar.std(dim=(2, 3), keepdim=True) + eps
+        illum_prob = torch.sigmoid((illum_scalar - mu_i) / sd_i)
+        noise_prob = torch.sigmoid((noise_scalar - mu_n) / sd_n)
+
+        illum_w = scalar_to_windows(illum_prob)
+        noise_w = scalar_to_windows(noise_prob)
 
         # Normalize and modulate
         qw = F.normalize(qw, dim=-1)
         kw = F.normalize(kw, dim=-1)
 
-        qw = qw * (1.0 + illum_w)
-        kw = kw * (1.0 - noise_w).clamp(0.0, 1.0)
+        qw = qw * (1.0 + 0.2 * illum_w)
+        kw = kw * (1.0 - 0.2 * noise_w).clamp(0.0, 1.0)
 
         # Windowed attention: [B,H,Nh,Nw,S,S]
         scale = d**-0.5

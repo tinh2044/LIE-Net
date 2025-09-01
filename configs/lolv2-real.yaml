@@ -17,10 +17,10 @@ model:
   loss:
     charbonnier: 1.0
     chroma: 1.0
-    edge: 2.0  # Increased for better edge preservation
-    frequency: 1.5  # Increased for better detail preservation
-    perceptual: 0.2
-    l1: 0.5  # Added L1 loss for edge preservation
+    edge: 2.0  # keep moderate edge emphasis
+    frequency: 0.1  # reduced; stronger FFT norm will scale it
+    perceptual: 0.1  # reduced to avoid dominating optimization
+    l1: 1.0  # stronger pixel constraint for PSNR stability
 
 training:
   model_dir: "./outputs_LOLv2"
@@ -38,7 +38,7 @@ training:
     
     scheduler:
       name: "CosineAnnealingLR"
-      T_max: 800
+      T_max: 2000  # align with planned epochs if stepping per-epoch
       eta_min: 0.00001
 
 evaluation:

@@ -251,8 +251,8 @@ class FrequencyLoss(nn.Module):
         return self.loss_weight * self.criterion(pred_freq, target_freq)
 
     def get_fft_amplitude(self, inp):
-        # Use "forward" norm to normalize by sqrt(N) and match typical FFT scale
-        inp_freq = torch.fft.rfft2(inp, norm="forward")
+        # Use "backward" norm to increase amplitude scale for stronger signal
+        inp_freq = torch.fft.rfft2(inp, norm="backward")
         amp = torch.abs(inp_freq)
         return amp
 
@@ -364,6 +364,16 @@ class VGGLoss(nn.Module):
 
     def forward(self, x, y):
         """Compute perceptual loss between x and y"""
+        # Clamp to [0,1] then normalize to ImageNet statistics expected by VGG
+        mean = torch.tensor([0.485, 0.456, 0.406], device=x.device, dtype=x.dtype).view(
+            1, 3, 1, 1
+        )
+        std = torch.tensor([0.229, 0.224, 0.225], device=x.device, dtype=x.dtype).view(
+            1, 3, 1, 1
+        )
+        x = (x.clamp(0.0, 1.0) - mean) / std
+        y = (y.clamp(0.0, 1.0) - mean) / std
+
         x_features = self.extract_features(x)
         y_features = self.extract_features(y)
 

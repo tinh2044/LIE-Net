@@ -87,6 +87,8 @@ def evaluate_fn(
 
             # Forward pass
             pred_l = model(inputs)
+            # Clamp predictions for fair metrics and saving
+            pred_l = pred_l.clamp(0.0, 1.0)
 
             # Compute loss
             loss_dict = loss_fn(pred_l, targets)
