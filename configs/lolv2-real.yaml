@@ -16,7 +16,7 @@ model:
   ch: [16, 16, 32, 64]
   loss:
     charbonnier: 2.0  
-    perceptual: 0.02  
+    perceptual: 0.2  
     ssim: 0.1
     grad: 0.2         
 
