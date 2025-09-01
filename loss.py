@@ -386,8 +386,8 @@ class Gradient_Loss(nn.Module):
         grad = 0
         y = x
         yy = xx
-        gradient_x = F.conv2d(y, self.weight_g, groups=3)
-        gradient_xx = F.conv2d(yy, self.weight_g, groups=3)
+        gradient_x = F.conv2d(y, self.weight_g.to(y.device), groups=3)
+        gradient_xx = F.conv2d(yy, self.weight_g.to(yy.device), groups=3)
         l = nn.L1Loss()
         a = l(gradient_x, gradient_xx)
         grad = grad + a
