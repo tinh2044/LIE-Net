@@ -47,7 +47,7 @@ class SmoothedValue(object):
 
     @property
     def global_avg(self):
-        return self.total / self.count
+        return self.total / (self.count + 0.00001)
 
     @property
     def max(self):
