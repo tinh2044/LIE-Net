@@ -36,7 +36,7 @@ training:
     
     scheduler:
       name: "CosineAnnealingLR"
-      T_max: 2000  # align with planned epochs if stepping per-epoch
+      T_max: 200
       eta_min: 0.00001
 
 evaluation:
