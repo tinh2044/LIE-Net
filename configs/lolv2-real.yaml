@@ -24,7 +24,7 @@ model:
 
 training:
   model_dir: "./outputs_LOLv2"
-  learning_rate: 1e-3
+  learning_rate: 0.0001
   weight_decay: 2e-5
   warmup_epochs: 0
   print_freq: 100
@@ -32,7 +32,7 @@ training:
   optimization:
     optimizer:
       name: "AdamW"
-      lr: 0.0003
+      lr: 0.0001
       weight_decay: 0.0001
       betas: [0.9, 0.999]
     
