@@ -8,7 +8,7 @@ from PIL import Image
 def save_img(image_tensor, filename):
     """Save image tensor to file"""
     image_numpy = image_tensor.detach().float().cpu().numpy()
-    image_numpy = (np.transpose(image_numpy, (1, 2, 0)) + 1) / 2.0 * 255.0
+    image_numpy = np.transpose(image_numpy, (1, 2, 0)) * 255.0
     image_numpy = image_numpy.clip(0, 255)
     image_numpy = image_numpy.astype(np.uint8)
     image_pil = Image.fromarray(image_numpy)
@@ -217,81 +217,6 @@ def save_sample_images(inputs, pred, targets, batch_idx, epoch, output_dir):
     # save_labeled_sample_images(inputs, pred, targets, batch_idx, epoch, output_dir)
 
 
-def save_labeled_sample_images(inputs, pred, targets, batch_idx, epoch, output_dir):
-    """Save sample images with labels: Input, Pred, Ground Truth"""
-    from PIL import Image, ImageDraw, ImageFont
-    import numpy as np
-
-    # Save first image in batch
-    input_img = inputs[0]
-    pred_img = pred[0]
-    target_img = targets[0]
-
-    # Convert tensors to PIL images
-    def tensor_to_pil(tensor):
-        img_np = tensor.detach().float().cpu().numpy()
-        img_np = (np.transpose(img_np, (1, 2, 0)) + 1) / 2.0 * 255.0
-        img_np = img_np.clip(0, 255).astype(np.uint8)
-        return Image.fromarray(img_np)
-
-    input_pil = tensor_to_pil(input_img)
-    pred_pil = tensor_to_pil(pred_img)
-    target_pil = tensor_to_pil(target_img)
-
-    # Get dimensions
-    img_width, img_height = input_pil.size
-
-    # Create a new image with space for labels
-    label_height = 30
-    combined_height = img_height + label_height
-    combined_width = img_width * 3
-
-    # Create combined image
-    combined_img = Image.new("RGB", (combined_width, combined_height), color="white")
-
-    # Paste images
-    combined_img.paste(input_pil, (0, label_height))
-    combined_img.paste(pred_img, (img_width, label_height))
-    combined_img.paste(target_pil, (img_width * 2, label_height))
-
-    # Add labels
-    draw = ImageDraw.Draw(combined_img)
-
-    # Try to use a default font, fallback to basic if not available
-    try:
-        font = ImageFont.truetype("arial.ttf", 20)
-    except:
-        try:
-            font = ImageFont.truetype("/System/Library/Fonts/Arial.ttf", 20)
-        except:
-            font = ImageFont.load_default()
-
-    # Calculate text positions (centered above each image)
-    labels = ["Input", "Pred", "Ground Truth"]
-    for i, label in enumerate(labels):
-        x = img_width * i + img_width // 2
-        y = label_height // 2
-
-        # Get text size for centering
-        bbox = draw.textbbox((0, 0), label, font=font)
-        text_width = bbox[2] - bbox[0]
-        text_height = bbox[3] - bbox[1]
-
-        # Center the text
-        x = x - text_width // 2
-        y = y - text_height // 2
-
-        # Draw text with black color
-        draw.text((x, y), label, fill="black", font=font)
-
-    # Save labeled image
-    labeled_filename = os.path.join(
-        output_dir, f"sample_{batch_idx}_{epoch}_labeled.png"
-    )
-    combined_img.save(labeled_filename)
-    print(f"Labeled sample saved: {labeled_filename}")
-
-
 def save_eval_images(inputs, pred, targets, filenames, epoch, output_dir):
     """Save evaluation images"""
     save_dir = os.path.join(output_dir, "eval", f"epoch_{epoch}")
@@ -302,16 +227,6 @@ def save_eval_images(inputs, pred, targets, filenames, epoch, output_dir):
         pred_img = pred[i]
         target_img = targets[i]
 
-        # Save individual images
-        input_path = os.path.join(save_dir, f"{filename}_input.png")
-        pred_path = os.path.join(save_dir, f"{filename}_pred.png")
-        target_path = os.path.join(save_dir, f"{filename}_target.png")
-
-        save_img(input_img, input_path)
-        save_img(pred_img, pred_path)
-        save_img(target_img, target_path)
-
-        # Save combined image
         combined = torch.cat([input_img, pred_img, target_img], dim=2)
         combined_path = os.path.join(save_dir, f"{filename}_combined.png")
         save_img(combined, combined_path)
