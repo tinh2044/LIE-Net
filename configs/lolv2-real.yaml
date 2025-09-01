@@ -1,5 +1,5 @@
 data:
-  root: "./datasets/LOL/"
+  root: "./datasets/LOL"
   train_dir: "train"
   test_dir: "test"
   input_dir: "low"

@@ -41,6 +41,9 @@ def train_one_epoch(
         optimizer.step()
 
         # Update metrics
+        # Learning rate (for pretty logging and to avoid empty meter on first step)
+        if len(optimizer.param_groups) > 0 and "lr" in optimizer.param_groups[0]:
+            metric_logger.update(lr=float(optimizer.param_groups[0]["lr"]))
         for loss_name, loss_value in loss_dict.items():
             metric_logger.update(**{f"{loss_name}_loss": loss_value.item()})
 
