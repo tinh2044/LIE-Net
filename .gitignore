@@ -2,7 +2,7 @@
 .history
 datasets/
 logs/
-outputs/
+output*/
 Relatedworks/
 Supplemental Materials/
 *.txt

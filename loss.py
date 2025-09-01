@@ -215,48 +215,6 @@ class MSELoss(nn.Module):
         )
 
 
-class FrequencyLoss(nn.Module):
-    """
-    Calculates the amplitude of frequencies loss.
-    """
-
-    def __init__(self, loss_weight=0.01, criterion="l2", reduction="mean"):
-        super(FrequencyLoss, self).__init__()
-        if reduction not in ["none", "mean", "sum"]:
-            raise ValueError(
-                f"Unsupported reduction mode: {reduction}. "
-                f"Supported ones are: {_reduction_modes}"
-            )
-        self.loss_weight = loss_weight
-        self.reduction = reduction
-
-        if criterion == "l1":
-            self.criterion = nn.L1Loss(reduction=reduction)
-        elif criterion == "l2":
-            self.criterion = nn.MSELoss(reduction=reduction)
-        else:
-            raise NotImplementedError("Unsupported criterion loss")
-
-    def forward(self, pred, target, weight=None, **kwargs):
-        """
-        Args:
-            pred (Tensor): of shape (N, C, H, W). Predicted tensor.
-            target (Tensor): of shape (N, C, H, W). Ground truth tensor.
-            weight (Tensor, optional): of shape (N, C, H, W). Element-wise
-                weights. Default: None.
-        """
-        pred_freq = self.get_fft_amplitude(pred)
-        target_freq = self.get_fft_amplitude(target)
-
-        return self.loss_weight * self.criterion(pred_freq, target_freq)
-
-    def get_fft_amplitude(self, inp):
-        # Use "backward" norm to increase amplitude scale for stronger signal
-        inp_freq = torch.fft.rfft2(inp, norm="backward")
-        amp = torch.abs(inp_freq)
-        return amp
-
-
 class CharbonnierLoss(nn.Module):
     """Charbonnier loss (one variant of Robust L1Loss, a differentiable
     variant of L1Loss).
@@ -386,46 +344,6 @@ class VGGLoss(nn.Module):
         return self.loss_weight * loss
 
 
-class EdgeLoss(nn.Module):
-    def __init__(self, loss_weight=1.0, criterion="l2", reduction="mean"):
-        super(EdgeLoss, self).__init__()
-        if reduction not in ["none", "mean", "sum"]:
-            raise ValueError(
-                f"Unsupported reduction mode: {reduction}. "
-                f"Supported ones are: {_reduction_modes}"
-            )
-
-        if criterion == "l1":
-            self.criterion = nn.L1Loss(reduction=reduction)
-        elif criterion == "l2":
-            self.criterion = nn.MSELoss(reduction=reduction)
-        else:
-            raise NotImplementedError("Unsupported criterion loss")
-
-        k = torch.Tensor([[0.05, 0.25, 0.4, 0.25, 0.05]])
-        self.kernel = torch.matmul(k.t(), k).unsqueeze(0).repeat(3, 1, 1, 1)
-
-        self.weight = loss_weight
-
-    def conv_gauss(self, img):
-        n_channels, _, kw, kh = self.kernel.shape
-        img = F.pad(img, (kw // 2, kh // 2, kw // 2, kh // 2), mode="replicate")
-        return F.conv2d(img, self.kernel.to(img.device), groups=n_channels)
-
-    def laplacian_kernel(self, current):
-        filtered = self.conv_gauss(current)
-        down = filtered[:, :, ::2, ::2]
-        new_filter = torch.zeros_like(filtered)
-        new_filter[:, :, ::2, ::2] = down * 4
-        filtered = self.conv_gauss(new_filter)
-        diff = current - filtered
-        return diff
-
-    def forward(self, x, y):
-        loss = self.criterion(self.laplacian_kernel(x), self.laplacian_kernel(y))
-        return loss * self.weight
-
-
 def SSIM_loss(pred_img, real_img, data_range):
     loss = pytorch_msssim.ssim(pred_img, real_img, data_range=data_range)
     return loss
@@ -451,6 +369,31 @@ class SSIMloss(nn.Module):
         return self.loss_weight * (1 - SSIM_loss(pred, target, self.data_range))
 
 
+class Gradient_Loss(nn.Module):
+    def __init__(self, weight):
+        super(Gradient_Loss, self).__init__()
+
+        kernel_g = [
+            [[0, 1, 0], [1, -4, 1], [0, 1, 0]],
+            [[0, 1, 0], [1, -4, 1], [0, 1, 0]],
+            [[0, 1, 0], [1, -4, 1], [0, 1, 0]],
+        ]
+        kernel_g = torch.FloatTensor(kernel_g).unsqueeze(0).permute(1, 0, 2, 3)
+        self.weight_g = nn.Parameter(data=kernel_g, requires_grad=False)
+        self.weight = weight
+
+    def forward(self, x, xx):
+        grad = 0
+        y = x
+        yy = xx
+        gradient_x = F.conv2d(y, self.weight_g, groups=3)
+        gradient_xx = F.conv2d(yy, self.weight_g, groups=3)
+        l = nn.L1Loss()
+        a = l(gradient_x, gradient_xx)
+        grad = grad + a
+        return self.weight * grad
+
+
 class LowLightLoss(nn.Module):
     """Combined loss for Low Light Image Enhancement"""
 
@@ -467,39 +410,26 @@ class LowLightLoss(nn.Module):
             reduction=loss_weights.get("perceptual_reduction", "mean"),
             loss_weight=loss_weights.get("perceptual", 1),
         )
-        self.edge_loss = EdgeLoss(
-            loss_weight=loss_weights.get("edge", 2),  # Increased edge loss weight
-            criterion=loss_weights.get("edge_criterion", "l2"),
-            reduction=loss_weights.get("edge_reduction", "mean"),
+        # Add SSIM loss (1-SSIM)
+        self.ssim_loss = SSIMloss(
+            loss_weight=loss_weights.get("ssim", 0.0),
+            data_range=loss_weights.get("ssim_range", 1.0),
         )
-        self.frequency_loss = FrequencyLoss(
-            loss_weight=loss_weights.get(
-                "frequency", 1.5
-            ),  # Increased frequency loss weight
-            reduction=loss_weights.get("frequency_reduction", "mean"),
-            criterion=loss_weights.get("frequency_criterion", "l2"),
-        )
-        # Add L1 loss for better edge preservation
-        self.l1_loss = L1Loss(
-            loss_weight=loss_weights.get("l1", 0.5),
-            reduction=loss_weights.get("l1_reduction", "mean"),
-        )
+        self.grad = Gradient_Loss(weight=loss_weights.get("grad", 0.0))
 
     def forward(self, pred, target):
         charbonnier_loss = self.charbonnier_loss(pred, target)
         perceptual_loss = self.perceptual_loss(pred, target)
-        edge_loss = self.edge_loss(pred, target)
-        frequency_loss = self.frequency_loss(pred, target)
-        l1_loss = self.l1_loss(pred, target)
+        ssim_loss = self.ssim_loss(pred, target)
+        grad_loss = self.grad(pred, target)
 
         total_loss = (
-            charbonnier_loss + perceptual_loss + edge_loss + frequency_loss + l1_loss
+            charbonnier_loss + perceptual_loss + grad_loss + l1_loss + ssim_loss
         )
         return {
             "total": total_loss,
             "charbonnier": charbonnier_loss,
             "perceptual": perceptual_loss,
-            "edge": edge_loss,
-            "frequency": frequency_loss,
-            "l1": l1_loss,
+            "grad": grad_loss,
+            "ssim": ssim_loss,
         }

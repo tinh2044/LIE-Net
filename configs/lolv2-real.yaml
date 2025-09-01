@@ -18,9 +18,10 @@ model:
     charbonnier: 1.0
     chroma: 1.0
     edge: 2.0  # keep moderate edge emphasis
-    frequency: 0.0  # reduced; stronger FFT norm will scale it
+    frequency: 0.0  # disable since it destabilized training
     perceptual: 0.1  # reduced to avoid dominating optimization
-    l1: 1.0  # stronger pixel constraint for PSNR stability
+    ssim: 0.1  # structural constraint to improve PSNR/SSIM stability
+    grad: 1.0  # gradient constraint to improve edge preservation
 
 training:
   model_dir: "./outputs_LOLv2"
