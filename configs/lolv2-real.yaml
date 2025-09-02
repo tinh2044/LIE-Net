@@ -9,9 +9,9 @@ data:
 
 model:
   in_ch: 3
-  c0: 128
-  c1: 192
-  c2: 256
+  c0: 64
+  c1: 128
+  c2: 192
   enc_blocks: [2, 2, 3]
   dec_blocks: [2, 2, 3]
   asp_patch: 8
