@@ -137,7 +137,12 @@ def main(args, cfg):
     n_parameters = utils.count_model_parameters(model)
 
     if is_distributed:
-        model = DDP(model, device_ids=[local_rank], output_device=local_rank)
+        model = DDP(
+            model,
+            device_ids=[local_rank],
+            output_device=local_rank,
+            find_unused_parameters=True,
+        )
         model_for_params = model.module
     else:
         model_for_params = model

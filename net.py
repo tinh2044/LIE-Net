@@ -356,8 +356,7 @@ class NoirNetASP(nn.Module):
         # Encoder level 2
         e2 = self.enc2(d1)  # (B, c2, H/4, W/4)
 
-        # Bottleneck readout (coarse low-res RGB)
-        lowres = self.readout(e2)  # (B, 3, H/4, W/4)
+        # Bottleneck readout (coarse low-res RGB) computed only if side_loss is requested
 
         # Decoder up 2->1
         u2 = self.up2_proj(e2)  # (B, 4*c1, H/4, W/4)
@@ -382,6 +381,7 @@ class NoirNetASP(nn.Module):
 
         if side_loss:
             # also return low-resolution readout (up-sample to original size if needed)
+            lowres = self.readout(e2)  # (B, 3, H/4, W/4)
             lowres_ups = F.interpolate(
                 lowres, size=(H, W), mode="bilinear", align_corners=False
             )
