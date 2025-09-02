@@ -1,428 +1,412 @@
+# noirnet_asp.py
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import math
-
-import sys
-import os
-
-sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 
-class IlluminationExtractionModule(nn.Module):
-    def __init__(self, channels):
-        super(IlluminationExtractionModule, self).__init__()
-        self.conv = nn.Conv2d(channels, channels, kernel_size=3, padding=1, bias=False)
-        # Use ReLU6 for sharper activation instead of sigmoid
-        self.activation = nn.ReLU6()
-        # Add batch norm for better training stability
-        self.bn = nn.BatchNorm2d(channels)
+class LayerNormFunction(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, x, weight, bias, eps):
+        ctx.eps = eps
+        N, C, H, W = x.size()
+        mu = x.mean(1, keepdim=True)
+        var = (x - mu).pow(2).mean(1, keepdim=True)
+        y = (x - mu) / (var + eps).sqrt()
+        ctx.save_for_backward(y, var, weight)
+        y = weight.view(1, C, 1, 1) * y + bias.view(1, C, 1, 1)
+        return y
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        eps = ctx.eps
+        N, C, H, W = grad_output.size()
+        y, var, weight = ctx.saved_variables
+        g = grad_output * weight.view(1, C, 1, 1)
+        mean_g = g.mean(dim=1, keepdim=True)
+        mean_gy = (g * y).mean(dim=1, keepdim=True)
+        gx = 1.0 / torch.sqrt(var + eps) * (g - y * mean_gy - mean_g)
+        return (
+            gx,
+            (grad_output * y).sum(dim=3).sum(dim=2).sum(dim=0),
+            grad_output.sum(dim=3).sum(dim=2).sum(dim=0),
+            None,
+        )
+
+
+class LayerNorm2d(nn.Module):
+    def __init__(self, channels, eps=1e-6):
+        super().__init__()
+        self.register_parameter("weight", nn.Parameter(torch.ones(channels)))
+        self.register_parameter("bias", nn.Parameter(torch.zeros(channels)))
+        self.eps = eps
 
     def forward(self, x):
-        # Apply convolution and batch norm
-        out = self.bn(self.conv(x))
-        # Use ReLU6 for sharper, more defined illumination maps
-        illumination_map = self.activation(out)
-        return illumination_map
+        return LayerNormFunction.apply(x, self.weight, self.bias, self.eps)
 
 
-class NoiseEstimationModule(nn.Module):
-    def __init__(self, channels):
-        super(NoiseEstimationModule, self).__init__()
-        self.conv = nn.Conv2d(channels, channels, kernel_size=3, padding=1, bias=False)
-        # Use ReLU6 for sharper activation instead of sigmoid
-        self.activation = nn.ReLU6()
-        # Add batch norm for better training stability
-        self.bn = nn.BatchNorm2d(channels)
+class SimpleGate(nn.Module):
+    def forward(self, x):
+        # split channel dimension in half and multiply
+        x1, x2 = x.chunk(2, dim=1)
+        return x1 * x2
+
+
+def conv_dw(in_c, out_c, k=3, stride=1, dilation=1):
+    pad = (k - 1) // 2 * dilation
+    return nn.Sequential(
+        nn.Conv2d(
+            in_c,
+            in_c,
+            kernel_size=k,
+            stride=stride,
+            padding=pad,
+            dilation=dilation,
+            groups=in_c,
+            bias=True,
+        ),
+        nn.Conv2d(in_c, out_c, kernel_size=1, stride=1, padding=0, bias=True),
+    )
+
+
+class ASPModule(nn.Module):
+    def __init__(self, channels, patch_size=8, K=16, mlp_exp=4):
+        super().__init__()
+        self.C = channels
+        self.p = patch_size
+        self.B = patch_size * patch_size
+        self.K = K
+
+        # encoder (dictionary projection): B -> K (no bias)
+        self.enc = nn.Linear(self.B, self.K, bias=False)
+        # small coefficient MLP (shared across channels and spatial dims)
+        self.mlp = nn.Sequential(
+            nn.Linear(self.K, self.K * mlp_exp, bias=True),
+            nn.ReLU(inplace=True),
+            nn.Linear(self.K * mlp_exp, self.K, bias=True),
+        )
+        # decoder D: K -> B (no bias), reconstruct patch coefficients
+        self.dec = nn.Linear(self.K, self.B, bias=False)
+
+        # small learnable amplitude scale per-channel (start small)
+        self.gamma = nn.Parameter(torch.ones(1) * 0.1)  # scalar per module (level)
+        # follow with pointwise conv to mix channels after inverse fft
+        self.post_pw = nn.Conv2d(channels, channels, 1, bias=True)
 
     def forward(self, x):
-        # Apply convolution and batch norm
-        out = self.bn(self.conv(x))
-        # Use ReLU6 for sharper, more defined noise maps
-        out = self.activation(out)
+        """
+        x: (B, C, H, W) float
+        returns: same shape
+        """
+        B, C, H, W = x.shape
+        assert C == self.C, f"ASPModule C mismatch ({C} vs {self.C})"
+        p = self.p
+        # compute FFT per sample/channel
+        Xf = torch.fft.fft2(x)  # complex tensor (B, C, H, W)
+        mag = torch.abs(Xf)  # (B, C, H, W)
+        pha = torch.angle(Xf)  # (B, C, H, W)
+
+        # extract low-frequency patch from amplitude (we use the top-left p x p block,
+        # where DC is at index 0 in PyTorch's FFT)
+        patch = mag[:, :, :p, :p].contiguous()  # (B, C, p, p)
+        patch_flat = patch.view(B * C, -1)  # (B*C, B)
+
+        # encode to coefficients
+        alpha = self.enc(patch_flat)  # (B*C, K)
+        # MLP correction
+        alpha_corr = self.mlp(alpha)  # (B*C, K)
+        # decode
+        patch_recon = self.dec(alpha_corr)  # (B*C, B)
+        patch_recon = patch_recon.view(B, C, p, p)  # (B, C, p, p)
+
+        # delta amplitude patch (recon - orig)
+        delta_patch = (patch_recon - patch).to(x.dtype)  # (B, C, p, p)
+
+        # build delta amplitude full map (zeros except in low-freq region)
+        delta_map = torch.zeros_like(
+            mag, device=x.device, dtype=x.dtype
+        )  # (B, C, H, W)
+        delta_map[:, :, :p, :p] = delta_patch
+
+        # apply correction to magnitude
+        mag_new = mag + self.gamma * delta_map  # (B, C, H, W)
+
+        # rebuild complex spectrum and inverse FFT
+        real = mag_new * torch.cos(pha)
+        imag = mag_new * torch.sin(pha)
+        complex_new = torch.complex(real, imag)  # complex tensor (B, C, H, W)
+        x_rec = torch.fft.ifft2(
+            complex_new
+        ).real  # back to real spatial domain (B, C, H, W)
+
+        # light channel mixing
+        x_rec = self.post_pw(x_rec)
+
+        # we return multiplicative correction to preserve residual behavior:
+        # apply sigmoid gating to keep scale stable and then multiply with original features
+        gate = torch.sigmoid(x_rec)
+        out = x * (1.0 + gate)  # encourage the ASP to modulate original features
+
         return out
 
 
-class IlluminationAwareGate(nn.Module):
-    def __init__(self, channels, b=1, gamma=2):
-        super(IlluminationAwareGate, self).__init__()
-        self.iem = IlluminationExtractionModule(channels)
-        self.avg_pool = nn.AdaptiveAvgPool2d(1)
-        self.max_pool = nn.AdaptiveMaxPool2d(1)
+class SpatialMixer(nn.Module):
+    def __init__(self, channels, dw_kernel=3, r=8):
+        super().__init__()
         self.channels = channels
-        self.b = b
-        self.gamma = gamma
-        kernel_s = self.kernel_size()
-        self.conv_dw = nn.Conv1d(
-            1, 1, kernel_size=kernel_s, padding=(kernel_s - 1) // 2, bias=False
+        pad = (dw_kernel - 1) // 2
+        # depthwise conv (groups=channels)
+        self.dw = nn.Conv2d(
+            channels,
+            channels,
+            kernel_size=dw_kernel,
+            padding=pad,
+            groups=channels,
+            bias=True,
         )
-        self.act = nn.GELU()
-        self.conv_pw = nn.Conv1d(1, 1, kernel_size=1, bias=False)
-        # Use LeakyReLU for sharper activation and better gradient flow
-        self.activation = nn.LeakyReLU(negative_slope=0.1, inplace=True)
-        # Add edge-preserving mechanism
-        self.edge_conv = nn.Conv2d(
-            channels, channels, kernel_size=3, padding=1, bias=False
+        # pointwise conv
+        self.pw = nn.Conv2d(channels, channels, kernel_size=1, bias=True)
+        # SCA (reduction r)
+        self.sca = nn.Sequential(
+            nn.AdaptiveAvgPool2d(1),
+            nn.Conv2d(channels, channels // r, kernel_size=1, bias=True),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(channels // r, channels, kernel_size=1, bias=True),
+            nn.Sigmoid(),
         )
-
-    def kernel_size(self):
-        k = int(abs((math.log2(self.channels) / self.gamma) + self.b / self.gamma))
-        return k if k % 2 else k + 1
 
     def forward(self, x):
-        b, c, h, w = x.shape
+        y = self.dw(x)
+        y = self.pw(y)
+        att = self.sca(y)
+        return y * att
 
-        illumination_info = self.iem(x)
 
-        y_avg = self.avg_pool(illumination_info)
-        y_max = self.max_pool(illumination_info)
-        y = 0.5 * (y_avg + y_max)
-        y = y.squeeze(-1).transpose(-1, -2)
-        y = self.conv_dw(y)
-        y = self.act(y)
-        y = self.conv_pw(y)
-        y = y.transpose(-1, -2).unsqueeze(-1)
-        # Use LeakyReLU for sharper activation
-        y = self.activation(y)
+class EBlock(nn.Module):
+    """
+    EBlock: SpatialMixer + ASP fused via 1x1 conv and residuals
+    """
 
-        # Add edge-preserving mechanism
-        edge_features = self.edge_conv(x)
-        edge_weight = torch.sigmoid(edge_features.mean(dim=1, keepdim=True))
+    def __init__(self, channels, patch_size=8, asp_K=16):
+        super().__init__()
+        self.norm = LayerNorm2d(channels)
+        self.spatial = SpatialMixer(channels)
+        self.asp = ASPModule(channels, patch_size=patch_size, K=asp_K)
+        self.fuse = nn.Conv2d(channels, channels, kernel_size=1, bias=True)
+        # small gating parameters for residuals
+        self.beta = nn.Parameter(torch.zeros(1, channels, 1, 1))
+        self.gamma = nn.Parameter(torch.zeros(1, channels, 1, 1))
 
-        # Combine illumination-aware gating with edge preservation (tamed)
-        gate_weight = torch.sigmoid(y).expand_as(x)
-        final_weight = gate_weight * (1.0 + 0.05 * edge_weight)
-
-        out = x * final_weight
+    def forward(self, x):
+        # normalization
+        z = self.norm(x)
+        # spatial path
+        sp = self.spatial(z)
+        # frequency path (works on original z)
+        fr = self.asp(z)
+        # fuse and residual
+        fused = self.fuse(sp + fr)
+        x1 = x + self.beta * fused
+        # second tiny gated FFN (pointwise)
+        y = F.relu(self.fuse(x1))
+        y = self.fuse(y)
+        out = x1 + self.gamma * y
         return out
 
 
-class IlluminationGuidedAttention(nn.Module):
-    def __init__(self, channels, num_heads, window_size: int = 8):
-        super(IlluminationGuidedAttention, self).__init__()
-        self.num_heads = num_heads
-        self.temperature = nn.Parameter(torch.ones(1, num_heads, 1, 1, 1, 1))
-        assert channels % num_heads == 0, "channels must be divisible by num_heads"
-        self.head_dim = channels // num_heads
-        self.window_size = window_size
-
-        self.iem = IlluminationExtractionModule(channels)
-        self.nem = NoiseEstimationModule(channels)
-        self.iem_dw = nn.Conv2d(
-            channels, channels, kernel_size=3, padding=1, groups=channels, bias=False
+class DBlock(nn.Module):
+    def __init__(self, channels, dilations=[1, 4, 9], r=8):
+        super().__init__()
+        self.norm = LayerNorm2d(channels)
+        self.channels = channels
+        # three dilated depthwise conv branches
+        self.branches = nn.ModuleList()
+        for d in dilations:
+            pad = d
+            self.branches.append(
+                nn.Conv2d(
+                    channels,
+                    channels,
+                    kernel_size=3,
+                    padding=pad,
+                    dilation=d,
+                    groups=channels,
+                    bias=True,
+                )
+            )
+        # pointwise mixing
+        self.pw = nn.Conv2d(channels, channels, kernel_size=1, bias=True)
+        # SCA
+        self.sca = nn.Sequential(
+            nn.AdaptiveAvgPool2d(1),
+            nn.Conv2d(channels, channels // r, kernel_size=1, bias=True),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(channels // r, channels, kernel_size=1, bias=True),
+            nn.Sigmoid(),
         )
-        self.nem_dw = nn.Conv2d(
-            channels, channels, kernel_size=3, padding=1, groups=channels, bias=False
-        )
-
-        # Linear projections for Q, K, V
-        self.q_conv = nn.Conv2d(channels, channels, kernel_size=1, bias=False)
-        self.k_conv = nn.Conv2d(channels, channels, kernel_size=1, bias=False)
-        self.v_conv = nn.Conv2d(channels, channels, kernel_size=1, bias=False)
-
-        self.project_out = nn.Conv2d(channels, channels, kernel_size=1, bias=False)
+        # gated-FFN (lightweight)
+        self.ffn_a = nn.Conv2d(channels, channels, kernel_size=1, bias=True)
+        self.ffn_b = nn.Conv2d(channels, channels, kernel_size=1, bias=True)
+        self.ffn_out = nn.Conv2d(channels, channels, kernel_size=1, bias=True)
+        # gated params
+        self.gamma = nn.Parameter(torch.zeros(1, channels, 1, 1))
+        self.beta = nn.Parameter(torch.zeros(1, channels, 1, 1))
 
     def forward(self, x):
-        b, c, h, w = x.shape
-
-        ws = self.window_size
-        pad_h = (ws - (h % ws)) % ws
-        pad_w = (ws - (w % ws)) % ws
-
-        if pad_h or pad_w:
-            x = F.pad(x, (0, pad_w, 0, pad_h), mode="replicate")
-        hp, wp = x.shape[-2:]
-
-        # Illumination and noise priors with light locality smoothing
-        iem_out = self.iem(x)
-        illumination_map = self.iem_dw(iem_out)  # [B,C,Hp,Wp]
-
-        nem_out = self.nem(x)
-        noise_map = self.nem_dw(nem_out)  # [B,C,Hp,Wp]
-
-        # Scalar priors per spatial position for modulation
-        illum_scalar = illumination_map.mean(dim=1, keepdim=True)  # [B,1,Hp,Wp]
-        noise_scalar = noise_map.mean(dim=1, keepdim=True)  # [B,1,Hp,Wp]
-
-        # Projections
-        q = self.q_conv(illumination_map)
-        k = self.k_conv(noise_map)
-        v = self.v_conv(x)
-
-        # Reshape into non-overlapping windows
-        heads = self.num_heads
-        d = self.head_dim
-        nh = hp // ws
-        nw = wp // ws
-
-        def to_windows(t):
-            t = t.view(b, heads, d, hp, wp).permute(0, 1, 3, 4, 2)  # [B,H,Hp,Wp,D]
-            t = t.view(b, heads, nh, ws, nw, ws, d).permute(0, 1, 2, 4, 3, 5, 6)
-            t = t.reshape(b, heads, nh, nw, ws * ws, d)  # [B,H,Nh,Nw,S,D]
-            return t
-
-        def scalar_to_windows(t):
-            t = t.view(b, 1, hp, wp).unsqueeze(1)  # [B,1,Hp,Wp] -> [B,1,1,Hp,Wp]
-            t = t.view(b, 1, nh, ws, nw, ws).permute(0, 1, 2, 4, 3, 5)
-            t = t.reshape(b, 1, nh, nw, ws * ws, 1)  # [B,1,Nh,Nw,S,1]
-            return t
-
-        qw = to_windows(q)
-        kw = to_windows(k)
-        vw = to_windows(v)
-
-        # Stabilize priors via per-batch z-score and sigmoid
-        eps = 1e-6
-        mu_i = illum_scalar.mean(dim=(2, 3), keepdim=True)
-        sd_i = illum_scalar.std(dim=(2, 3), keepdim=True) + eps
-        mu_n = noise_scalar.mean(dim=(2, 3), keepdim=True)
-        sd_n = noise_scalar.std(dim=(2, 3), keepdim=True) + eps
-        illum_prob = torch.sigmoid((illum_scalar - mu_i) / sd_i)
-        noise_prob = torch.sigmoid((noise_scalar - mu_n) / sd_n)
-
-        illum_w = scalar_to_windows(illum_prob)
-        noise_w = scalar_to_windows(noise_prob)
-
-        # Normalize and modulate
-        qw = F.normalize(qw, dim=-1)
-        kw = F.normalize(kw, dim=-1)
-
-        qw = qw * (1.0 + 0.2 * illum_w)
-        kw = kw * (1.0 - 0.2 * noise_w).clamp(0.0, 1.0)
-
-        # Windowed attention: [B,H,Nh,Nw,S,S]
-        scale = d**-0.5
-        attn = torch.matmul(qw, kw.transpose(-2, -1)) * scale
-        attn = attn * self.temperature
-        attn = torch.softmax(attn, dim=-1)
-        outw = torch.matmul(attn, vw)  # [B,H,Nh,Nw,S,D]
-
-        # Merge windows back
-        outw = outw.view(b, heads, nh, nw, ws, ws, d).permute(0, 1, 6, 2, 4, 3, 5)
-        out = outw.reshape(b, heads * d, nh * ws, nw * ws)  # [B,C,Hp,Wp]
-
-        if pad_h or pad_w:
-            out = out[:, :, :h, :w]
-
-        out = self.project_out(out)
+        y = self.norm(x)
+        # branches
+        bsum = 0
+        for br in self.branches:
+            bsum = bsum + br(y)
+        bsum = F.gelu(bsum)
+        mixed = self.pw(bsum)
+        att = self.sca(mixed)
+        mixed = mixed * att
+        x1 = x + self.beta * mixed
+        # gated FFN
+        a = self.ffn_a(x1)
+        b = torch.sigmoid(self.ffn_b(x1))
+        f = a * b
+        f = self.ffn_out(f)
+        out = x1 + self.gamma * f
         return out
 
 
-class GDFN(nn.Module):
-    def __init__(self, channels, expansion_factor):
-        super(GDFN, self).__init__()
-        hidden_channels = int(channels * expansion_factor)
-        self.project_in = nn.Conv2d(
-            channels, hidden_channels * 2, kernel_size=1, bias=False
-        )
-        self.conv = nn.Conv2d(
-            hidden_channels * 2,
-            hidden_channels * 2,
-            kernel_size=3,
-            padding=1,
-            groups=hidden_channels * 2,
-            bias=False,
-        )
-        self.project_out = nn.Conv2d(
-            hidden_channels, channels, kernel_size=1, bias=False
-        )
-
-    def forward(self, x):
-        x1, x2 = self.conv(self.project_in(x)).chunk(2, dim=1)
-        out = self.project_out(F.gelu(x1) * x2)
-        return out
-
-
-class DownSample(nn.Module):
-    def __init__(self, channels):
-        super(DownSample, self).__init__()
-        self.body = nn.Sequential(
-            nn.Conv2d(channels, channels // 2, kernel_size=3, padding=1, bias=False),
-            nn.PixelUnshuffle(2),
-        )
-
-    def forward(self, x):
-        out = self.body(x)
-        return out
-
-
-class UpSample(nn.Module):
-    def __init__(self, channels):
-        super(UpSample, self).__init__()
-        self.body = nn.Sequential(
-            nn.Conv2d(channels, channels * 2, kernel_size=3, padding=1, bias=False),
-            nn.PixelShuffle(2),
-        )
-
-    def forward(self, x):
-        out = self.body(x)
-        return out
-
-
-class RestorationEnhancementAttention(nn.Module):
-    def __init__(self, channels, num_heads, expansion_factor):
-        super(RestorationEnhancementAttention, self).__init__()
-        self.norm1 = nn.LayerNorm(channels)
-        self.attn = IlluminationGuidedAttention(channels, num_heads)
-        self.norm2 = nn.LayerNorm(channels)
-        self.ffn = GDFN(channels, expansion_factor)
-
-    def forward(self, x):
-        b, c, h, w = x.shape
-        x_norm1 = (
-            self.norm1(x.reshape(b, c, -1).transpose(-2, -1).contiguous())
-            .transpose(-2, -1)
-            .contiguous()
-            .reshape(b, c, h, w)
-        )
-        x = x + self.attn(x_norm1)
-
-        x_norm2 = (
-            self.norm2(x.reshape(b, c, -1).transpose(-2, -1).contiguous())
-            .transpose(-2, -1)
-            .contiguous()
-            .reshape(b, c, h, w)
-        )
-        x = x + self.ffn(x_norm2)
-        return x
-
-
-class EdgeEnhancementModule(nn.Module):
-    """Module to enhance edges and reduce blurry effects"""
-
-    def __init__(self, channels):
-        super(EdgeEnhancementModule, self).__init__()
-        self.edge_conv1 = nn.Conv2d(
-            channels, channels, kernel_size=3, padding=1, bias=False
-        )
-        self.edge_conv2 = nn.Conv2d(
-            channels, channels, kernel_size=3, padding=1, bias=False
-        )
-        self.bn1 = nn.BatchNorm2d(channels)
-        self.bn2 = nn.BatchNorm2d(channels)
-        self.activation = nn.ReLU(inplace=True)
-
-    def forward(self, x):
-        # Extract edge features
-        edge1 = self.activation(self.bn1(self.edge_conv1(x)))
-        edge2 = self.activation(self.bn2(self.edge_conv2(edge1)))
-
-        # Enhance edges by adding edge information back
-        enhanced = x + 0.1 * edge2
-        return enhanced
-
-
-class LIENet(nn.Module):
+class NoirNetASP(nn.Module):
     def __init__(
         self,
-        num_blocks=[2, 2, 2, 2],
-        num_heads=[1, 2, 4, 8],
-        channels=[16, 32, 64, 128],
-        num_refinement=2,
-        expansion_factor=2.66,
-        loss={},
-        in_channels=3,
-        **kwargs,
+        in_ch=3,
+        c0=128,
+        c1=192,
+        c2=256,
+        enc_blocks=(2, 2, 3),
+        dec_blocks=(2, 2, 3),
+        asp_patch=8,
+        asp_K=16,
     ):
-        super(LIENet, self).__init__()
-        self.embed_conv = nn.Conv2d(
-            in_channels, channels[0], kernel_size=3, padding=1, bias=False
-        )
+        super().__init__()
+        # Stem
+        self.stem = nn.Conv2d(in_ch, c0, kernel_size=3, padding=1, bias=True)
 
-        self.encoders = nn.ModuleList(
-            [
-                nn.Sequential(
-                    *[
-                        RestorationEnhancementAttention(
-                            num_ch, num_ah, expansion_factor
-                        )
-                        for _ in range(num_tb)
-                    ]
-                )
-                for num_tb, num_ah, num_ch in zip(num_blocks, num_heads, channels)
-            ]
-        )
-
-        self.downs = nn.ModuleList([DownSample(num_ch) for num_ch in channels[:-1]])
-        self.ups = nn.ModuleList(
-            [UpSample(num_ch) for num_ch in list(reversed(channels))[:-1]]
-        )
-
-        # IAG for skip connections
-        self.iags = nn.ModuleList([IlluminationAwareGate(ch) for ch in channels[:-1]])
-
-        self.reduces = nn.ModuleList(
-            [
-                nn.Conv2d(channels[i], channels[i - 1], kernel_size=1, bias=False)
-                for i in reversed(
-                    range(1, len(channels))
-                )  # Adjust index for compatibility
-            ]
-        )
-
-        self.decoders = nn.ModuleList(
-            [
-                nn.Sequential(
-                    *[
-                        RestorationEnhancementAttention(ch, nh, expansion_factor)
-                        for _ in range(nb)
-                    ]
-                )
-                for nb, nh, ch in zip(
-                    reversed(num_blocks[:-1]),
-                    reversed(num_heads[:-1]),
-                    reversed(channels[:-1]),
-                )
-            ]
-        )
-
-        self.refinement = nn.Sequential(
+        # Encoder stacks
+        self.enc0 = nn.Sequential(
             *[
-                RestorationEnhancementAttention(
-                    channels[0], num_heads[0], expansion_factor
-                )
-                for _ in range(num_refinement)
+                EBlock(c0, patch_size=asp_patch, asp_K=asp_K)
+                for _ in range(enc_blocks[0])
+            ]
+        )
+        self.down0 = nn.Conv2d(c0, c1, kernel_size=3, stride=2, padding=1, bias=True)
+
+        self.enc1 = nn.Sequential(
+            *[
+                EBlock(c1, patch_size=asp_patch, asp_K=asp_K)
+                for _ in range(enc_blocks[1])
+            ]
+        )
+        self.down1 = nn.Conv2d(c1, c2, kernel_size=3, stride=2, padding=1, bias=True)
+
+        self.enc2 = nn.Sequential(
+            *[
+                EBlock(c2, patch_size=asp_patch, asp_K=asp_K)
+                for _ in range(enc_blocks[2])
             ]
         )
 
-        # Add edge enhancement module before output
-        self.edge_enhancement = EdgeEnhancementModule(channels[0])
+        # Bottleneck readout: low-res image (1x1 conv to RGB)
+        self.readout = nn.Conv2d(c2, in_ch, kernel_size=1, bias=True)
 
-        self.out_conv = nn.Conv2d(channels[0], 3, kernel_size=3, padding=1, bias=False)
+        # Decoder (upsample with PixelShuffle)
+        self.up2_proj = nn.Conv2d(
+            c2, 4 * c1, kernel_size=1, bias=True
+        )  # for PixelShuffle r=2 -> c1
+        self.dec1 = nn.Sequential(*[DBlock(c1) for _ in range(dec_blocks[0])])
 
-    def forward(self, x):
-        fo = self.embed_conv(x)
+        self.up1_proj = nn.Conv2d(
+            c1, 4 * c0, kernel_size=1, bias=True
+        )  # for PixelShuffle r=2 -> c0
+        self.dec0 = nn.Sequential(*[DBlock(c0) for _ in range(dec_blocks[1])])
 
-        # Encoder
-        encoder_features = []
-        for i in range(len(self.encoders)):
-            fo = self.encoders[i](fo)
-            encoder_features.append(fo)
-            if i < len(self.downs):
-                fo = self.downs[i](fo)
+        # final refinement blocks at full res
+        self.refine = nn.Sequential(*[DBlock(c0) for _ in range(dec_blocks[2])])
 
-        # Decoder
-        # fo is now the output of the last encoder
-        for i in range(len(self.decoders)):
-            fo = self.ups[i](fo)
-            # Get corresponding feature from encoder and apply OIB
-            enc_feat = encoder_features[-(i + 2)]
-            skip_feature = self.iags[-(i + 1)](enc_feat)
-            fo = torch.cat([fo, skip_feature], dim=1)
-            fo = self.reduces[i](fo)
-            fo = self.decoders[i](fo)
+        # final RGB conv
+        self.final = nn.Conv2d(c0, in_ch, kernel_size=3, padding=1, bias=True)
 
-        fr = self.refinement(fo)
-        # Apply edge enhancement before final output
-        fr = self.edge_enhancement(fr)
-        output = self.out_conv(fr)
+        # padder size ensures divisible by 4 (2^levels)
+        self.padder_size = 4
 
-        return output
+    def forward(self, inp: torch.Tensor, side_loss: bool = False):
+        """
+        Input:
+           inp: (B, 3, H, W)
+        Return:
+           out: (B, 3, H, W)
+           if side_loss=True also returns (lowres_readout, out)
+        """
+        B, C, H, W = inp.shape
+        x = self._pad_to_divisible(inp)
+
+        # Stem
+        x0 = self.stem(x)  # (B, c0, H, W)
+        # Encoder level 0
+        e0 = self.enc0(x0)
+        d0 = self.down0(e0)  # (B, c1, H/2, W/2)
+        # Encoder level 1
+        e1 = self.enc1(d0)
+        d1 = self.down1(e1)  # (B, c2, H/4, W/4)
+        # Encoder level 2
+        e2 = self.enc2(d1)  # (B, c2, H/4, W/4)
+
+        # Bottleneck readout (coarse low-res RGB)
+        lowres = self.readout(e2)  # (B, 3, H/4, W/4)
+
+        # Decoder up 2->1
+        u2 = self.up2_proj(e2)  # (B, 4*c1, H/4, W/4)
+        u2 = nn.PixelShuffle(2)(u2)  # (B, c1, H/2, W/2)
+        u2 = u2 + e1  # skip add
+        d1 = self.dec1(u2)
+
+        # Decoder up 1->0
+        u1 = self.up1_proj(d1)  # (B, 4*c0, H/2, W/2)
+        u1 = nn.PixelShuffle(2)(u1)  # (B, c0, H, W)
+        u1 = u1 + e0
+        d0 = self.dec0(u1)
+
+        # refinement
+        r = self.refine(d0)
+
+        out = self.final(r)
+        # residual to input
+        out = out + inp
+        # unpad
+        out = self._unpad_to_orig(out, H, W)
+
+        if side_loss:
+            # also return low-resolution readout (up-sample to original size if needed)
+            lowres_ups = F.interpolate(
+                lowres, size=(H, W), mode="bilinear", align_corners=False
+            )
+            return lowres_ups, out
+        else:
+            return out
+
+    def _pad_to_divisible(self, x: torch.Tensor) -> torch.Tensor:
+        _, _, h, w = x.size()
+        mod_h = (self.padder_size - h % self.padder_size) % self.padder_size
+        mod_w = (self.padder_size - w % self.padder_size) % self.padder_size
+        if mod_h == 0 and mod_w == 0:
+            return x
+        return F.pad(x, (0, mod_w, 0, mod_h), mode="reflect")
+
+    def _unpad_to_orig(self, x: torch.Tensor, H: int, W: int) -> torch.Tensor:
+        return x[:, :, :H, :W]
 
 
 if __name__ == "__main__":
-    model = LIENet(in_channels=3)
-    input = torch.randn(1, 3, 256, 256)
-    output = model(input)
-
-    print(f"Output shape: {output.shape}")
+    # small smoke test to verify forward shapes
+    device = "cpu"
+    model = NoirNetASP().to(device)
+    print(f"Model params: {sum(p.numel() for p in model.parameters()):,f}M")
+    inp = torch.randn(1, 3, 256, 256).to(device)
+    with torch.no_grad():
+        out = model(inp)
+    print("Input shape:", inp.shape, "Output shape:", out.shape)
