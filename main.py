@@ -18,7 +18,7 @@ from loguru import logger
 from loss import LowLightLoss
 from optimizer import build_optimizer, build_scheduler
 from dataset import get_training_set, get_test_set
-from net import LIENet
+from net import NoirNetASP
 from opt import train_one_epoch, evaluate_fn
 import utils
 
@@ -132,7 +132,7 @@ def main(args, cfg):
     )
 
     # Create model
-    model = LIENet(**cfg["model"])
+    model = NoirNetASP(**cfg["model"])
     model = model.to(device)
     n_parameters = utils.count_model_parameters(model)
 
