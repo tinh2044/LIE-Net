@@ -405,11 +405,11 @@ class LowLightLoss(nn.Module):
             loss_weight=loss_weights.get("charbonnier", 1),
             reduction=loss_weights.get("charbonnier_reduction", "mean"),
         )
-        self.perceptual_loss = VGGLoss(
-            criterion=loss_weights.get("perceptual_criterion", "l2"),
-            reduction=loss_weights.get("perceptual_reduction", "mean"),
-            loss_weight=loss_weights.get("perceptual", 1),
-        )
+        # self.perceptual_loss = VGGLoss(
+        #     criterion=loss_weights.get("perceptual_criterion", "l2"),
+        #     reduction=loss_weights.get("perceptual_reduction", "mean"),
+        #     loss_weight=loss_weights.get("perceptual", 1),
+        # )
         # Add SSIM loss (1-SSIM)
         self.ssim_loss = SSIMloss(
             loss_weight=loss_weights.get("ssim", 0.0),
@@ -419,15 +419,15 @@ class LowLightLoss(nn.Module):
 
     def forward(self, pred, target):
         charbonnier_loss = self.charbonnier_loss(pred, target)
-        perceptual_loss = self.perceptual_loss(pred, target)
+        # perceptual_loss = self.perceptual_loss(pred, target)
         ssim_loss = self.ssim_loss(pred, target)
         grad_loss = self.grad(pred, target)
 
-        total_loss = charbonnier_loss + perceptual_loss + grad_loss + ssim_loss
+        total_loss = charbonnier_loss + grad_loss + ssim_loss
         return {
             "total": total_loss,
             "charbonnier": charbonnier_loss,
-            "perceptual": perceptual_loss,
+            # "perceptual": perceptual_loss,
             "grad": grad_loss,
             "ssim": ssim_loss,
         }
