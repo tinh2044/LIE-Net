@@ -255,7 +255,7 @@ def main(args, cfg):
             loss_fn=loss_fn,
             print_freq=args.print_freq,
             results_path=f"{model_dir}/test_results.json",
-            log_dir=f"{log_dir}/eval/test",
+            log_dir=f"{log_dir}_eval_test",
         )
         if rank == 0:
             print(

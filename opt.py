@@ -100,9 +100,7 @@ def evaluate_fn(
                 metric_logger.update(**{f"{metric_name}": metric_value})
 
             if args.save_images:
-                save_eval_images(
-                    inputs, pred_l, targets, filenames, epoch, args.output_dir
-                )
+                save_eval_images(inputs, pred_l, targets, filenames, args.output_dir)
 
     metric_logger.synchronize_between_processes()
     print(f"Test stats: {metric_logger}")

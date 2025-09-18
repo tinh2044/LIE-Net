@@ -275,9 +275,7 @@ class NoirNetASP(nn.Module):
     def __init__(
         self,
         in_ch=3,
-        c0=128,
-        c1=192,
-        c2=256,
+        c=[16, 32, 64, 128],
         enc_blocks=(2, 2, 3),
         dec_blocks=(2, 2, 3),
         asp_patch=8,
@@ -285,54 +283,71 @@ class NoirNetASP(nn.Module):
     ):
         super().__init__()
         # Stem
-        self.stem = nn.Conv2d(in_ch, c0, kernel_size=3, padding=1, bias=True)
+        self.stem = nn.Conv2d(in_ch, c[0], kernel_size=3, padding=1, bias=True)
 
         # Encoder stacks
         self.enc0 = nn.Sequential(
             *[
-                EBlock(c0, patch_size=asp_patch, asp_K=asp_K)
+                EBlock(c[0], patch_size=asp_patch, asp_K=asp_K)
                 for _ in range(enc_blocks[0])
             ]
         )
-        self.down0 = nn.Conv2d(c0, c1, kernel_size=3, stride=2, padding=1, bias=True)
+        self.down0 = nn.Conv2d(
+            c[0], c[1], kernel_size=3, stride=2, padding=1, bias=True
+        )
 
         self.enc1 = nn.Sequential(
             *[
-                EBlock(c1, patch_size=asp_patch, asp_K=asp_K)
+                EBlock(c[1], patch_size=asp_patch, asp_K=asp_K)
                 for _ in range(enc_blocks[1])
             ]
         )
-        self.down1 = nn.Conv2d(c1, c2, kernel_size=3, stride=2, padding=1, bias=True)
+        self.down1 = nn.Conv2d(
+            c[1], c[2], kernel_size=3, stride=2, padding=1, bias=True
+        )
 
         self.enc2 = nn.Sequential(
             *[
-                EBlock(c2, patch_size=asp_patch, asp_K=asp_K)
+                EBlock(c[2], patch_size=asp_patch, asp_K=asp_K)
+                for _ in range(enc_blocks[2])
+            ]
+        )
+        self.down2 = nn.Conv2d(
+            c[2], c[3], kernel_size=3, stride=2, padding=1, bias=True
+        )
+        self.enc3 = nn.Sequential(
+            *[
+                EBlock(c[3], patch_size=asp_patch, asp_K=asp_K)
                 for _ in range(enc_blocks[2])
             ]
         )
 
         # Bottleneck readout: low-res image (1x1 conv to RGB)
-        self.readout = nn.Conv2d(c2, in_ch, kernel_size=1, bias=True)
+        self.readout = nn.Conv2d(c[3], in_ch, kernel_size=1, bias=True)
 
         # Decoder (upsample with PixelShuffle)
+        self.up3_proj = nn.Conv2d(
+            c[3], 4 * c[2], kernel_size=1, bias=True
+        )  # for PixelShuffle r=2 -> c2
+        self.dec2 = nn.Sequential(*[DBlock(c[2]) for _ in range(dec_blocks[0])])
         self.up2_proj = nn.Conv2d(
-            c2, 4 * c1, kernel_size=1, bias=True
+            c[2], 4 * c[1], kernel_size=1, bias=True
         )  # for PixelShuffle r=2 -> c1
-        self.dec1 = nn.Sequential(*[DBlock(c1) for _ in range(dec_blocks[0])])
+        self.dec1 = nn.Sequential(*[DBlock(c[1]) for _ in range(dec_blocks[0])])
 
         self.up1_proj = nn.Conv2d(
-            c1, 4 * c0, kernel_size=1, bias=True
+            c[1], 4 * c[0], kernel_size=1, bias=True
         )  # for PixelShuffle r=2 -> c0
-        self.dec0 = nn.Sequential(*[DBlock(c0) for _ in range(dec_blocks[1])])
+        self.dec0 = nn.Sequential(*[DBlock(c[0]) for _ in range(dec_blocks[1])])
 
         # final refinement blocks at full res
-        self.refine = nn.Sequential(*[DBlock(c0) for _ in range(dec_blocks[2])])
+        self.refine = nn.Sequential(*[DBlock(c[0]) for _ in range(dec_blocks[2])])
 
         # final RGB conv
-        self.final = nn.Conv2d(c0, in_ch, kernel_size=3, padding=1, bias=True)
+        self.final = nn.Conv2d(c[0], in_ch, kernel_size=3, padding=1, bias=True)
 
         # padder size ensures divisible by 4 (2^levels)
-        self.padder_size = 4
+        self.padder_size = 8
 
     def forward(self, inp: torch.Tensor, side_loss: bool = False):
         """
@@ -355,11 +370,20 @@ class NoirNetASP(nn.Module):
         d1 = self.down1(e1)  # (B, c2, H/4, W/4)
         # Encoder level 2
         e2 = self.enc2(d1)  # (B, c2, H/4, W/4)
+        # Encoder level 3
+        d2 = self.down2(e2)  # (B, c3, H/8, W/8)
+        e3 = self.enc3(d2)  # (B, c3, H/8, W/8)
 
         # Bottleneck readout (coarse low-res RGB) computed only if side_loss is requested
 
+        # Decoder up 3->2
+        u3 = self.up3_proj(e3)  # (B, 4*c2, H/8, W/8)
+        u3 = nn.PixelShuffle(2)(u3)  # (B, c2, H/4, W/4)
+        u3 = u3 + e2  # skip add
+        d2 = self.dec2(u3)
+
         # Decoder up 2->1
-        u2 = self.up2_proj(e2)  # (B, 4*c1, H/4, W/4)
+        u2 = self.up2_proj(d2)  # (B, 4*c1, H/4, W/4)
         u2 = nn.PixelShuffle(2)(u2)  # (B, c1, H/2, W/2)
         u2 = u2 + e1  # skip add
         d1 = self.dec1(u2)
@@ -381,7 +405,7 @@ class NoirNetASP(nn.Module):
 
         if side_loss:
             # also return low-resolution readout (up-sample to original size if needed)
-            lowres = self.readout(e2)  # (B, 3, H/4, W/4)
+            lowres = self.readout(e3)  # (B, 3, H/8, W/8)
             lowres_ups = F.interpolate(
                 lowres, size=(H, W), mode="bilinear", align_corners=False
             )

@@ -1,5 +1,5 @@
 data:
-  root: "./datasets/LOL/"
+  root: "./datasets/LOL"
   train_dir: "train"
   test_dir: "test"
   input_dir: "low"
@@ -8,23 +8,21 @@ data:
   max_len: 1  
 
 model:
-  num_blocks: [2, 3, 3, 4]
-  num_heads: [1, 2, 4, 8]
-  channels: [16, 32, 64, 128]
-  num_refinement: 4
-  expansion_factor: 2.66
-  ch: [16, 16, 32, 64]
-  loss:
-    charbonnier: 1.0
-    chroma: 1.0
-    edge: 2.0  # Increased for better edge preservation
-    frequency: 1.5  # Increased for better detail preservation
-    perceptual: 0.2
-    l1: 0.5  # Added L1 loss for edge preservation
+  in_ch: 3
+  c: [64, 128, 256, 512]
+  enc_blocks: [2, 2, 3, 3]
+  dec_blocks: [2, 2, 3, 3]
+  asp_patch: 8
+  asp_K: 16
+loss:
+    charbonnier: 1.0  
+    perceptual: 0.2  
+    ssim: 0.1
+    grad: 0.2         
 
 training:
   model_dir: "./outputs_LOL"
-  learning_rate: 1e-3
+  learning_rate: 0.0001
   weight_decay: 2e-5
   warmup_epochs: 0
   print_freq: 100
@@ -32,13 +30,13 @@ training:
   optimization:
     optimizer:
       name: "AdamW"
-      lr: 0.0003
+      lr: 0.0001
       weight_decay: 0.0001
       betas: [0.9, 0.999]
     
     scheduler:
       name: "CosineAnnealingLR"
-      T_max: 800
+      T_max: 200
       eta_min: 0.00001
 
 evaluation:
