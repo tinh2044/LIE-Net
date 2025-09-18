@@ -21,20 +21,14 @@ def count_model_parameters(model):
 
 
 def calculate_flops(model, input_shape, device="cpu"):
-    """Calculate FLOPs for model"""
-    try:
-        from thop import profile
+    from fvcore.nn import FlopCountAnalysis
 
-        input_tensor = torch.randn(input_shape).to(device)
-        flops, params = profile(model, inputs=(input_tensor,), verbose=False)
-        return flops, params
-    except ImportError:
-        print("thop not installed, skipping FLOPs calculation")
-        return None, None
+    input_tensor = torch.randn(input_shape).to(device)
+    flops = FlopCountAnalysis(model, input_tensor).total()
+    return flops
 
 
 def get_model_info(model, input_shape, device="cpu"):
-    """Get comprehensive model information"""
     total_params = sum(p.numel() for p in model.parameters())
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     non_trainable_params = total_params - trainable_params
@@ -49,10 +43,6 @@ def get_model_info(model, input_shape, device="cpu"):
     if flops is not None:
         info["flops"] = flops
         info["flops_str"] = f"{flops / 1e9:.2f}G"
-        info["macs"] = flops / 2
-        info["macs_str"] = f"{flops / 2e9:.2f}G"
-        info["params_str"] = f"{params / 1e6:.2f}M"
-
     return info
 
 

@@ -18,7 +18,7 @@ from loguru import logger
 from loss import LowLightLoss
 from optimizer import build_optimizer, build_scheduler
 from dataset import get_training_set, get_test_set
-from net import NoirNetASP
+from net import LIENet
 from opt import train_one_epoch, evaluate_fn
 import utils
 
@@ -132,7 +132,7 @@ def main(args, cfg):
     )
 
     # Create model
-    model = NoirNetASP(**cfg["model"])
+    model = LIENet(**cfg["model"])
     model = model.to(device)
     n_parameters = utils.count_model_parameters(model)
 
@@ -171,11 +171,7 @@ def main(args, cfg):
         print(f"  Total parameters: {model_info['total_params']:,}")
         print(f"  Trainable parameters: {model_info['trainable_params']:,}")
         print(f"  Non-trainable parameters: {model_info['non_trainable_params']:,}")
-
-        if "flops" in model_info:
-            print(f"  FLOPs: {model_info['flops_str']}")
-            print(f"  MACs: {model_info['macs_str']}")
-            print(f"  Parameters (from thop): {model_info['params_str']}")
+        print(f"  FLOPs: {model_info['flops_str']}")
         print()
     optimizer_config = cfg.get("training", {}).get("optimization", {})
     optimizer = build_optimizer(config=optimizer_config, model=model_for_params)
