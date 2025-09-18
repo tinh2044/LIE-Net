@@ -212,7 +212,7 @@ def main(args, cfg):
         last_epoch=scheduler_last_epoch,
     )
 
-    if args.resume:
+    if args.finetune:
         if (
             not args.eval
             and "optimizer_state_dict" in checkpoint
