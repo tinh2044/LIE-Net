@@ -39,7 +39,7 @@ def get_model_info(model, input_shape, device="cpu"):
         "non_trainable_params": non_trainable_params,
     }
 
-    flops, params = calculate_flops(model, input_shape, device)
+    flops = calculate_flops(model, input_shape, device)
     if flops is not None:
         info["flops"] = flops
         info["flops_str"] = f"{flops / 1e9:.2f}G"
