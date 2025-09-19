@@ -332,16 +332,10 @@ class VGGLoss(nn.Module):
         x = (x.clamp(0.0, 1.0) - mean) / std
         y = (y.clamp(0.0, 1.0) - mean) / std
 
-        x_features = []
-        y_features = []
-        for i in range(len(x)):
-            x_features.append(self.extract_features(x[i]))
-            y_features.append(self.extract_features(y[i]))
-
         loss = 0
-        for i in range(len(x_features)):
+        for i in range(len(x)):
             loss += self.weights[i] * self.criterion(
-                x_features[i], y_features[i].detach()
+                self.extract_features(x[i]), self.extract_features(y[i]).detach()
             )
 
         return self.loss_weight * loss
