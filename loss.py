@@ -337,7 +337,7 @@ class VGGLoss(nn.Module):
         for i in range(len(x)):
             x_features.append(self.extract_features(x[i]))
             y_features.append(self.extract_features(y[i]))
-            
+
         loss = 0
         for i in range(len(x_features)):
             loss += self.weights[i] * self.criterion(
@@ -370,6 +370,8 @@ class SSIMloss(nn.Module):
 
     def forward(self, pred, target, **kwargs):
         return self.loss_weight * (1 - SSIM_loss(pred, target, self.data_range))
+
+
 class Gradient_Loss(nn.Module):
     def __init__(self, weight):
         super(Gradient_Loss, self).__init__()
@@ -415,7 +417,6 @@ class LowLightLoss(nn.Module):
         self.ssim_loss = SSIMloss(
             loss_weight=loss_weights.get("ssim", 0.0),
             data_range=loss_weights.get("ssim_range", 1.0),
-            on_y=loss_weights.get("ssim_on_y", False),
         )
 
         self.grad = Gradient_Loss(weight=loss_weights.get("grad", 0.0))
