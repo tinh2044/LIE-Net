@@ -1,0 +1,47 @@
+data:
+  root: "./datasets/LOLv2-real"
+  train_dir: "train"
+  test_dir: "test"
+  input_dir: "low"
+  target_dir: "light"  
+  image_size: 256
+  max_len: 1  
+
+model:
+  in_ch: 3
+  c: [32, 64, 128, 256]
+  enc_blocks: [2, 2, 3, 3]
+  dec_blocks: [2, 2, 3, 3]
+  asp_patch: 8
+  asp_K: 16
+loss:
+    charbonnier: 1.0
+    ssim: 0.2
+    ssim_on_y: true
+    ms_ssim: 0.4
+    ms_ssim_on_y: true
+    grad: 0.15        
+
+training:
+  model_dir: "./output_LOLv2"
+  learning_rate: 0.0001
+  weight_decay: 2e-5
+  warmup_epochs: 0
+  print_freq: 100
+  
+  optimization:
+    optimizer:
+      name: "AdamW"
+      lr: 0.0001
+      weight_decay: 0.0001
+      betas: [0.9, 0.999]
+    
+    scheduler:
+      name: "CosineAnnealingLR"
+      T_max: 200
+      eta_min: 0.00001
+
+evaluation:
+  metrics: ["psnr", "ssim", "lpips"]
+  save_images: true
+  save_high_res: false 
