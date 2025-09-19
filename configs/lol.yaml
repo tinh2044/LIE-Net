@@ -15,11 +15,10 @@ model:
   asp_patch: 8
   asp_K: 16
 loss:
+    loss:
     charbonnier: 1.0
+    perceptual: 1.0
     ssim: 0.2
-    ssim_on_y: true
-    ms_ssim: 0.4
-    ms_ssim_on_y: true
     grad: 0.15        
 
 training:

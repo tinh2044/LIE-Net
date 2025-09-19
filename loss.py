@@ -332,9 +332,12 @@ class VGGLoss(nn.Module):
         x = (x.clamp(0.0, 1.0) - mean) / std
         y = (y.clamp(0.0, 1.0) - mean) / std
 
-        x_features = self.extract_features(x)
-        y_features = self.extract_features(y)
-
+        x_features = []
+        y_features = []
+        for i in range(len(x)):
+            x_features.append(self.extract_features(x[i]))
+            y_features.append(self.extract_features(y[i]))
+            
         loss = 0
         for i in range(len(x_features)):
             loss += self.weights[i] * self.criterion(
@@ -350,81 +353,23 @@ def SSIM_loss(pred_img, real_img, data_range):
 
 
 class SSIM(nn.Module):
-    def __init__(self, loss_weight=1.0, data_range=1.0, on_y: bool = False):
+    def __init__(self, loss_weight=1.0, data_range=1.0):
         super(SSIM, self).__init__()
         self.loss_weight = loss_weight
         self.data_range = data_range
-        self.on_y = on_y
-
-    @staticmethod
-    def _to_y(x: torch.Tensor) -> torch.Tensor:
-        if x.size(1) != 3:
-            return x
-        r, g, b = x[:, 0:1], x[:, 1:2], x[:, 2 : 2 + 1]
-        y = 0.299 * r + 0.587 * g + 0.114 * b
-        return y
 
     def forward(self, pred, target, **kwargs):
-        pred = pred.clamp(0.0, self.data_range)
-        target = target.clamp(0.0, self.data_range)
-        if self.on_y:
-            pred = self._to_y(pred)
-            target = self._to_y(target)
         return self.loss_weight * SSIM_loss(pred, target, self.data_range)
 
 
 class SSIMloss(nn.Module):
-    def __init__(self, loss_weight=1.0, data_range=1.0, on_y: bool = False):
+    def __init__(self, loss_weight=1.0, data_range=1.0):
         super(SSIMloss, self).__init__()
         self.loss_weight = loss_weight
         self.data_range = data_range
-        self.on_y = on_y
-
-    @staticmethod
-    def _to_y(x: torch.Tensor) -> torch.Tensor:
-        if x.size(1) != 3:
-            return x
-        r, g, b = x[:, 0:1], x[:, 1:2], x[:, 2 : 2 + 1]
-        y = 0.299 * r + 0.587 * g + 0.114 * b
-        return y
 
     def forward(self, pred, target, **kwargs):
-        pred = pred.clamp(0.0, self.data_range)
-        target = target.clamp(0.0, self.data_range)
-        if self.on_y:
-            pred = self._to_y(pred)
-            target = self._to_y(target)
         return self.loss_weight * (1 - SSIM_loss(pred, target, self.data_range))
-
-
-def MS_SSIM_loss(pred_img, real_img, data_range):
-    return pytorch_msssim.ms_ssim(pred_img, real_img, data_range=data_range)
-
-
-class MS_SSIMLoss(nn.Module):
-    def __init__(self, loss_weight=1.0, data_range=1.0, on_y: bool = False):
-        super(MS_SSIMLoss, self).__init__()
-        self.loss_weight = loss_weight
-        self.data_range = data_range
-        self.on_y = on_y
-
-    @staticmethod
-    def _to_y(x: torch.Tensor) -> torch.Tensor:
-        if x.size(1) != 3:
-            return x
-        r, g, b = x[:, 0:1], x[:, 1:2], x[:, 2 : 2 + 1]
-        y = 0.299 * r + 0.587 * g + 0.114 * b
-        return y
-
-    def forward(self, pred, target, **kwargs):
-        pred = pred.clamp(0.0, self.data_range)
-        target = target.clamp(0.0, self.data_range)
-        if self.on_y:
-            pred = self._to_y(pred)
-            target = self._to_y(target)
-        return self.loss_weight * (1 - MS_SSIM_loss(pred, target, self.data_range))
-
-
 class Gradient_Loss(nn.Module):
     def __init__(self, weight):
         super(Gradient_Loss, self).__init__()
@@ -461,32 +406,31 @@ class LowLightLoss(nn.Module):
             loss_weight=loss_weights.get("charbonnier", 1),
             reduction=loss_weights.get("charbonnier_reduction", "mean"),
         )
+        self.perceptual_loss = VGGLoss(
+            criterion=loss_weights.get("perceptual_criterion", "l2"),
+            reduction=loss_weights.get("perceptual_reduction", "mean"),
+            loss_weight=loss_weights.get("perceptual", 1),
+        )
         # Add SSIM and MS-SSIM losses (1 - score)
         self.ssim_loss = SSIMloss(
             loss_weight=loss_weights.get("ssim", 0.0),
             data_range=loss_weights.get("ssim_range", 1.0),
             on_y=loss_weights.get("ssim_on_y", False),
         )
-        self.ms_ssim_loss = MS_SSIMLoss(
-            loss_weight=loss_weights.get("ms_ssim", 0.0),
-            data_range=loss_weights.get(
-                "ms_ssim_range", loss_weights.get("ssim_range", 1.0)
-            ),
-            on_y=loss_weights.get("ms_ssim_on_y", False),
-        )
+
         self.grad = Gradient_Loss(weight=loss_weights.get("grad", 0.0))
 
     def forward(self, pred, target):
         charbonnier_loss = self.charbonnier_loss(pred, target)
+        perceptual_loss = self.perceptual_loss(pred, target)
         ssim_loss = self.ssim_loss(pred, target)
-        ms_ssim_loss = self.ms_ssim_loss(pred, target)
         grad_loss = self.grad(pred, target)
 
-        total_loss = charbonnier_loss + grad_loss + ssim_loss + ms_ssim_loss
+        total_loss = charbonnier_loss + perceptual_loss + grad_loss + ssim_loss
         return {
             "total": total_loss,
             "charbonnier": charbonnier_loss,
+            "perceptual": perceptual_loss,
             "grad": grad_loss,
             "ssim": ssim_loss,
-            "ms_ssim": ms_ssim_loss,
         }

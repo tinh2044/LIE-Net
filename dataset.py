@@ -1,8 +1,11 @@
 import os
 from pathlib import Path
+import random
 import torch
 import torch.utils.data as data
 import torchvision.transforms as transforms
+import torchvision.transforms.functional as TF
+from torchvision.transforms import InterpolationMode
 from PIL import Image
 
 
@@ -70,10 +73,10 @@ class LowLightDataset(data.Dataset):
         image_size = self.cfg.get("image_size", 256)
 
         if self.split == "train":
+            # Train split uses paired, custom augmentations in __getitem__ (no flips)
             transform = transforms.Compose(
                 [
                     transforms.Resize((image_size, image_size)),
-                    transforms.RandomHorizontalFlip(p=0.5),
                     transforms.ToTensor(),
                 ]
             )
@@ -86,6 +89,53 @@ class LowLightDataset(data.Dataset):
             )
 
         return transform
+
+    def _apply_train_transforms(
+        self, input_image: Image.Image, target_image: Image.Image
+    ):
+        """Apply paired augmentations to both input and target (no flip).
+
+        Uses RandomResizedCrop and small RandomRotation with identical params
+        on the pair to preserve alignment.
+        """
+        image_size = self.cfg.get("image_size", 256)
+
+        # Paired RandomResizedCrop
+        i, j, h, w = transforms.RandomResizedCrop.get_params(
+            input_image, scale=(0.8, 1.0), ratio=(0.95, 1.05)
+        )
+        inp = TF.resized_crop(
+            input_image,
+            i,
+            j,
+            h,
+            w,
+            (image_size, image_size),
+            interpolation=InterpolationMode.BILINEAR,
+        )
+        tar = TF.resized_crop(
+            target_image,
+            i,
+            j,
+            h,
+            w,
+            (image_size, image_size),
+            interpolation=InterpolationMode.BILINEAR,
+        )
+
+        # Paired small rotation (no flip)
+        angle = random.uniform(-3.0, 3.0)
+        inp = TF.rotate(
+            inp, angle, interpolation=InterpolationMode.BILINEAR, expand=False, fill=0
+        )
+        tar = TF.rotate(
+            tar, angle, interpolation=InterpolationMode.BILINEAR, expand=False, fill=0
+        )
+
+        # To tensor
+        inp_t = TF.to_tensor(inp)
+        tar_t = TF.to_tensor(tar)
+        return inp_t, tar_t
 
     def __len__(self):
         return len(self.image_files)
@@ -102,8 +152,13 @@ class LowLightDataset(data.Dataset):
         target_image = Image.open(target_path).convert("RGB")
 
         # Apply transforms
-        input_tensor = self.transform(input_image)
-        target_tensor = self.transform(target_image)
+        if self.split == "train":
+            input_tensor, target_tensor = self._apply_train_transforms(
+                input_image, target_image
+            )
+        else:
+            input_tensor = self.transform(input_image)
+            target_tensor = self.transform(target_image)
 
         return {
             "input": input_tensor,

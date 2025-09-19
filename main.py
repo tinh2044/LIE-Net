@@ -239,7 +239,6 @@ def main(args, cfg):
 
     args.output_dir = model_dir
     args.save_images = cfg.get("evaluation", {}).get("save_images", False)
-
     output_dir = Path(model_dir)
 
     # Add loss function and output directory to args
