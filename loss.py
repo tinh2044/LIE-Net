@@ -3,6 +3,7 @@ from typing import Dict
 import torch
 from torch import nn as nn
 from torchvision.models import vgg as vgg
+from torch.utils.checkpoint import checkpoint
 
 from torch import autograd as autograd
 from torch.nn import functional as F
@@ -321,7 +322,7 @@ class VGGLoss(nn.Module):
         return [h_relu1, h_relu2, h_relu3, h_relu4, h_relu5]
 
     def forward(self, x, y):
-        """Compute perceptual loss between x and y"""
+        """Compute perceptual loss between x and y - memory optimized with gradient checkpointing"""
         # Clamp to [0,1] then normalize to ImageNet statistics expected by VGG
         mean = torch.tensor([0.485, 0.456, 0.406], device=x.device, dtype=x.dtype).view(
             1, 3, 1, 1
@@ -332,11 +333,38 @@ class VGGLoss(nn.Module):
         x = (x.clamp(0.0, 1.0) - mean) / std
         y = (y.clamp(0.0, 1.0) - mean) / std
 
-        loss = 0
-        for i in range(len(x)):
-            loss += self.weights[i] * self.criterion(
-                self.extract_features(x[i]), self.extract_features(y[i]).detach()
-            )
+        # Use gradient checkpointing for memory efficiency
+        def compute_vgg_loss(x, y):
+            loss = 0
+
+            # Layer 1: conv1_1, relu1_1
+            h_x = self.slice1(x)
+            h_y = self.slice1(y)
+            loss += self.weights[0] * self.criterion(h_x, h_y.detach())
+
+            # Layer 2: conv1_2, relu1_2, pool1, conv2_1, relu2_1, conv2_2, relu2_2, pool2
+            h_x = self.slice2(h_x)
+            h_y = self.slice2(h_y)
+            loss += self.weights[1] * self.criterion(h_x, h_y.detach())
+
+            # Layer 3: conv3_1, relu3_1, conv3_2, relu3_2, conv3_3, relu3_3, conv3_4, relu3_4, pool3
+            h_x = self.slice3(h_x)
+            h_y = self.slice3(h_y)
+            loss += self.weights[2] * self.criterion(h_x, h_y.detach())
+
+            # Layer 4: conv4_1, relu4_1, conv4_2, relu4_2, conv4_3, relu4_3, conv4_4, relu4_4, pool4
+            h_x = self.slice4(h_x)
+            h_y = self.slice4(h_y)
+            loss += self.weights[3] * self.criterion(h_x, h_y.detach())
+
+            # Layer 5: conv5_1, relu5_1, conv5_2, relu5_2, conv5_3, relu5_3, conv5_4, relu5_4, pool5
+            h_x = self.slice5(h_x)
+            h_y = self.slice5(h_y)
+            loss += self.weights[4] * self.criterion(h_x, h_y.detach())
+
+            return loss
+
+        loss = compute_vgg_loss(x, y)
 
         return self.loss_weight * loss
 
@@ -385,14 +413,14 @@ class Gradient_Loss(nn.Module):
         yy = xx
         gradient_x = F.conv2d(y, self.weight_g.to(y.device), groups=3)
         gradient_xx = F.conv2d(yy, self.weight_g.to(yy.device), groups=3)
-        l = nn.L1Loss()
-        a = l(gradient_x, gradient_xx)
+        l1_criterion = nn.L1Loss()
+        a = l1_criterion(gradient_x, gradient_xx)
         grad = grad + a
         return self.weight * grad
 
 
 class LowLightLoss(nn.Module):
-    """Combined loss for Low Light Image Enhancement"""
+    """Combined loss for Low Light Image Enhancement - Memory Optimized"""
 
     def __init__(self, loss_weights: Dict, **kwargs):
         super(LowLightLoss, self).__init__()
@@ -402,24 +430,47 @@ class LowLightLoss(nn.Module):
             loss_weight=loss_weights.get("charbonnier", 1),
             reduction=loss_weights.get("charbonnier_reduction", "mean"),
         )
-        self.perceptual_loss = VGGLoss(
-            criterion=loss_weights.get("perceptual_criterion", "l2"),
-            reduction=loss_weights.get("perceptual_reduction", "mean"),
-            loss_weight=loss_weights.get("perceptual", 1),
-        )
-        # Add SSIM and MS-SSIM losses (1 - score)
-        self.ssim_loss = SSIMloss(
-            loss_weight=loss_weights.get("ssim", 0.0),
-            data_range=loss_weights.get("ssim_range", 1.0),
-        )
 
-        self.grad = Gradient_Loss(weight=loss_weights.get("grad", 0.0))
+        # Only create perceptual loss if weight > 0 to save memory
+        if loss_weights.get("perceptual", 0) > 0:
+            self.perceptual_loss = VGGLoss(
+                criterion=loss_weights.get("perceptual_criterion", "l2"),
+                reduction=loss_weights.get("perceptual_reduction", "mean"),
+                loss_weight=loss_weights.get("perceptual", 1),
+            )
+        else:
+            self.perceptual_loss = None
+
+        # Only create SSIM loss if weight > 0
+        if loss_weights.get("ssim", 0) > 0:
+            self.ssim_loss = SSIMloss(
+                loss_weight=loss_weights.get("ssim", 0.0),
+                data_range=loss_weights.get("ssim_range", 1.0),
+            )
+        else:
+            self.ssim_loss = None
+
+        # Only create gradient loss if weight > 0
+        if loss_weights.get("grad", 0) > 0:
+            self.grad = Gradient_Loss(weight=loss_weights.get("grad", 0.0))
+        else:
+            self.grad = None
 
     def forward(self, pred, target):
         charbonnier_loss = self.charbonnier_loss(pred, target)
-        perceptual_loss = self.perceptual_loss(pred, target)
-        ssim_loss = self.ssim_loss(pred, target)
-        grad_loss = self.grad(pred, target)
+
+        # Only compute losses that are enabled
+        perceptual_loss = 0
+        if self.perceptual_loss is not None:
+            perceptual_loss = self.perceptual_loss(pred, target)
+
+        ssim_loss = 0
+        if self.ssim_loss is not None:
+            ssim_loss = self.ssim_loss(pred, target)
+
+        grad_loss = 0
+        if self.grad is not None:
+            grad_loss = self.grad(pred, target)
 
         total_loss = charbonnier_loss + perceptual_loss + grad_loss + ssim_loss
         return {
