@@ -21,7 +21,7 @@ loss:
     grad: 0.2         
 
 training:
-  model_dir: "./outputs_LOLv2"
+  model_dir: "./output_LOLv2"
   learning_rate: 0.0001
   weight_decay: 2e-5
   warmup_epochs: 0

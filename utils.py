@@ -20,7 +20,7 @@ def count_model_parameters(model):
     return sum(p.numel() for p in model.parameters() if p.requires_grad)
 
 
-def calculate_flops(model, input_shape, device="cpu"):
+def calculate_flops(model, input_shape, device):
     from fvcore.nn import FlopCountAnalysis
 
     input_tensor = torch.randn(input_shape).to(device)
@@ -28,7 +28,7 @@ def calculate_flops(model, input_shape, device="cpu"):
     return flops
 
 
-def get_model_info(model, input_shape, device="cpu"):
+def get_model_info(model, input_shape, device):
     total_params = sum(p.numel() for p in model.parameters())
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     non_trainable_params = total_params - trainable_params
@@ -116,12 +116,15 @@ def check_state_dict(model, state_dict):
     missing_keys = model_keys - state_dict_keys
     if missing_keys:
         print(f"Missing keys in state dict: {missing_keys}")
-        return False
 
-    # Check if all state dict keys are in model
+    match_key = model_keys & state_dict_keys
+    if match_key:
+        print(f"Matching keys in state dict: {match_key}")
     unexpected_keys = state_dict_keys - model_keys
     if unexpected_keys:
         print(f"Unexpected keys in state dict: {unexpected_keys}")
+
+    if missing_keys or unexpected_keys:
         return False
 
     return True
@@ -207,3 +210,73 @@ def save_eval_images(inputs, pred, targets, filenames, output_dir):
         combined = torch.cat([input_img, pred_img, target_img], dim=2)
         combined_path = os.path.join(save_dir, f"{filename}_combined.png")
         save_img(combined, combined_path)
+
+
+def _maybe_strip_prefix(state_dict, prefix: str):
+    """Return a copy of state_dict with a leading prefix stripped from all keys
+    when every key starts with that prefix. Otherwise returns the original dict.
+    """
+    if not isinstance(state_dict, dict):
+        return state_dict
+    keys = list(state_dict.keys())
+    if len(keys) == 0:
+        return state_dict
+    if all(k.startswith(prefix) for k in keys):
+        plen = len(prefix)
+        return {k[plen:]: v for k, v in state_dict.items()}
+    return state_dict
+
+
+def extract_model_state_dict(checkpoint_or_state):
+    """Extract the model's state_dict from a checkpoint dict or return the dict itself.
+
+    Args:
+        checkpoint_or_state (dict): A checkpoint dict or a model state dict.
+
+    Returns:
+        dict: The model state dict.
+    """
+    obj = checkpoint_or_state
+    if isinstance(obj, dict):
+        for key in ("model_state_dict", "state_dict", "model"):
+            if key in obj and isinstance(obj[key], dict):
+                return obj[key]
+    return obj
+
+
+def align_and_filter_state_dict(model, state_dict):
+    """Align keys to the target model and filter out non-matching entries.
+    """
+    raw_sd = extract_model_state_dict(state_dict)
+    # Normalize common prefixes
+    sd = _maybe_strip_prefix(raw_sd, "module.")
+    sd = _maybe_strip_prefix(sd, "model.")
+
+    model_keys = set(model.state_dict().keys())
+    sd_keys = set(sd.keys())
+
+    # Keep only overlapping keys
+    filtered = {k: v for k, v in sd.items() if k in model_keys}
+
+    missing = model_keys - set(filtered.keys())
+    unexpected = sd_keys - model_keys
+    return filtered, missing, unexpected
+
+
+def load_pretrained_flexibly(model, checkpoint_or_path, device="cpu", strict=False):
+    """Load weights into model handling DDP prefixes and key mismatches gracefully.
+    """
+    if isinstance(checkpoint_or_path, str):
+        try:
+            checkpoint = torch.load(
+                checkpoint_or_path, map_location=device, weights_only=True
+            )
+        except TypeError:
+            checkpoint = torch.load(checkpoint_or_path, map_location=device)
+    else:
+        checkpoint = checkpoint_or_path
+
+    state_dict = extract_model_state_dict(checkpoint)
+    aligned, missing, unexpected = align_and_filter_state_dict(model, state_dict)
+    ret = model.load_state_dict(aligned, strict=strict)
+    return ret, missing, unexpected, checkpoint

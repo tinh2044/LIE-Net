@@ -49,7 +49,7 @@ def get_args_parser():
         "--start_epoch", default=0, type=int, metavar="N", help="start epoch"
     )
     parser.add_argument("--eval", action="store_true", help="Perform evaluation only")
-    parser.add_argument("--num_workers", default=4, type=int)
+    parser.add_argument("--num_workers", default=0, type=int)
 
     parser.add_argument(
         "--cfg",
@@ -190,21 +190,20 @@ def main(args, cfg):
     if args.resume:
         if rank == 0:
             print(f"Resume training from {args.resume}")
-        checkpoint = torch.load(args.resume, map_location="cpu")
-        if utils.check_state_dict(model_for_params, checkpoint["model_state_dict"]):
-            ret = model_for_params.load_state_dict(
-                checkpoint["model_state_dict"], strict=False
-            )
-        else:
-            print("Model and state dict are different")
-            raise ValueError("Model and state dict are different")
-
-        if "epoch" in checkpoint:
-            scheduler_last_epoch = checkpoint["epoch"]
-        args.start_epoch = checkpoint["epoch"] + 1
+        ret, missing_keys, unexpected_keys, checkpoint = utils.load_pretrained_flexibly(
+            model_for_params, args.resume, device="cpu", strict=False
+        )
         if rank == 0:
-            print("Missing keys: \n", "\n".join(ret.missing_keys))
-            print("Unexpected keys: \n", "\n".join(ret.unexpected_keys))
+            if missing_keys:
+                print(f"Missing keys in state dict: {missing_keys}")
+            if unexpected_keys:
+                print(f"Unexpected keys in state dict: {unexpected_keys}")
+
+        if isinstance(checkpoint, dict) and "epoch" in checkpoint:
+            scheduler_last_epoch = checkpoint["epoch"]
+            args.start_epoch = checkpoint["epoch"] + 1
+    else:
+        checkpoint = None
 
     scheduler, scheduler_type = build_scheduler(
         config=cfg["training"]["optimization"],
@@ -212,7 +211,7 @@ def main(args, cfg):
         last_epoch=scheduler_last_epoch,
     )
 
-    if args.resume:
+    if args.resume and checkpoint is not None:
         if (
             not args.eval
             and "optimizer_state_dict" in checkpoint
@@ -225,21 +224,18 @@ def main(args, cfg):
                 scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
             if rank == 0:
                 print(f"New learning rate : {scheduler.get_last_lr()[0]}")
-                
+
     if args.finetune:
         if rank == 0:
             print(f"Fine tune training from {args.finetune}")
-        checkpoint = torch.load(args.finetune, map_location="cpu")
-        if utils.check_state_dict(model_for_params, checkpoint["model_state_dict"]):
-            ret = model_for_params.load_state_dict(
-                checkpoint["model_state_dict"], strict=False
-            )
-        else:
-            print("Model and state dict are different")
-            raise ValueError("Model and state dict are different")
+        ret, missing_keys, unexpected_keys, _ = utils.load_pretrained_flexibly(
+            model_for_params, args.finetune, device="cpu", strict=False
+        )
         if rank == 0:
-            print("Missing keys: \n", "\n".join(ret.missing_keys))
-            print("Unexpected keys: \n", "\n".join(ret.unexpected_keys))
+            if missing_keys:
+                print(f"Missing keys in state dict: {missing_keys}")
+            if unexpected_keys:
+                print(f"Unexpected keys in state dict: {unexpected_keys}")
 
     args.output_dir = model_dir
     args.save_images = cfg.get("evaluation", {}).get("save_images", False)

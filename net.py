@@ -3,6 +3,10 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
+def conv3x3(in_ch, out_ch, stride=1, bias=False):
+    return nn.Conv2d(in_ch, out_ch, kernel_size=3, stride=stride, padding=1, bias=bias)
+
+
 class LayerNormFunction(torch.autograd.Function):
     @staticmethod
     def forward(ctx, x, weight, bias, eps):
@@ -181,6 +185,47 @@ class SpatialMixer(nn.Module):
         return y * att
 
 
+class Downsample(nn.Module):
+    def __init__(self, in_channels: int, out_channels: int, kernel_size: int = 3):
+        super().__init__()
+        self.down = nn.Conv2d(
+            in_channels,
+            out_channels,
+            kernel_size=kernel_size,
+            stride=2,
+            padding=(kernel_size - 1) // 2,
+            bias=True,
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.down(x)
+
+
+class Upsample(nn.Module):
+    def __init__(
+        self,
+        in_channels: int,
+        out_channels: int,
+        scale_factor: float = 2.0,
+        mode: str = "bilinear",
+        align_corners: bool = False,
+    ):
+        super().__init__()
+        self.scale_factor = scale_factor
+        self.mode = mode
+        self.align_corners = align_corners
+        self.proj = nn.Conv2d(in_channels, out_channels, kernel_size=1, bias=True)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x_up = F.interpolate(
+            x,
+            scale_factor=self.scale_factor,
+            mode=self.mode,
+            align_corners=self.align_corners,
+        )
+        return self.proj(x_up)
+
+
 class EBlock(nn.Module):
     """
     EBlock: SpatialMixer + ASP fused via 1x1 conv and residuals
@@ -276,78 +321,74 @@ class NoirNetASP(nn.Module):
         self,
         in_ch=3,
         c=[16, 32, 64, 128],
-        enc_blocks=(2, 2, 3),
-        dec_blocks=(2, 2, 3),
+        enc_blocks=(2, 2, 3, 5),
+        dec_blocks=(2, 2, 3, 5),
         asp_patch=8,
         asp_K=16,
     ):
         super().__init__()
-        # Stem
-        self.stem = nn.Conv2d(in_ch, c[0], kernel_size=3, padding=1, bias=True)
+        self.stem = nn.Conv2d(
+            in_channels=in_ch,
+            out_channels=c[0],
+            kernel_size=3,
+            padding=1,
+            stride=1,
+            bias=True,
+        )
+        self.final = nn.Conv2d(
+            in_channels=c[0],
+            out_channels=in_ch,
+            kernel_size=3,
+            padding=1,
+            stride=1,
+            bias=True,
+        )
 
-        # Encoder stacks
-        self.enc0 = nn.Sequential(
+        self.encoders = nn.ModuleList()
+        self.downs = nn.ModuleList()
+        for i in range(len(c) - 1):
+            num_blocks = enc_blocks[i] if i < len(enc_blocks) else enc_blocks[-1]
+            self.encoders.append(
+                nn.Sequential(
+                    *[
+                        EBlock(c[i], patch_size=asp_patch, asp_K=asp_K)
+                        for _ in range(num_blocks)
+                    ]
+                )
+            )
+            self.downs.append(Downsample(c[i], c[i + 1], kernel_size=3))
+
+        mid_enc_blocks = enc_blocks[-1] if len(enc_blocks) > 0 else 1
+        self.middle_blks_enc = nn.Sequential(
             *[
-                EBlock(c[0], patch_size=asp_patch, asp_K=asp_K)
-                for _ in range(enc_blocks[0])
+                EBlock(c[-1], patch_size=asp_patch, asp_K=asp_K)
+                for _ in range(mid_enc_blocks)
             ]
         )
-        self.down0 = nn.Conv2d(
-            c[0], c[1], kernel_size=3, stride=2, padding=1, bias=True
+        mid_dec_blocks = dec_blocks[0] if len(dec_blocks) > 0 else 1
+        self.middle_blks_dec = nn.Sequential(
+            *[DBlock(c[-1]) for _ in range(mid_dec_blocks)]
         )
 
-        self.enc1 = nn.Sequential(
-            *[
-                EBlock(c[1], patch_size=asp_patch, asp_K=asp_K)
-                for _ in range(enc_blocks[1])
-            ]
-        )
-        self.down1 = nn.Conv2d(
-            c[1], c[2], kernel_size=3, stride=2, padding=1, bias=True
-        )
+        self.ups = nn.ModuleList()
+        self.decoders = nn.ModuleList()
+        for i in range(len(c) - 2, -1, -1):
+            self.ups.append(Upsample(c[i + 1], c[i]))
+            if i == 0:
+                num_dec = dec_blocks[1] if len(dec_blocks) > 1 else dec_blocks[0]
+            else:
+                num_dec = dec_blocks[0] if len(dec_blocks) > 0 else 1
+            self.decoders.append(nn.Sequential(*[DBlock(c[i]) for _ in range(num_dec)]))
 
-        self.enc2 = nn.Sequential(
-            *[
-                EBlock(c[2], patch_size=asp_patch, asp_K=asp_K)
-                for _ in range(enc_blocks[2])
-            ]
-        )
-        self.down2 = nn.Conv2d(
-            c[2], c[3], kernel_size=3, stride=2, padding=1, bias=True
-        )
-        self.enc3 = nn.Sequential(
-            *[
-                EBlock(c[3], patch_size=asp_patch, asp_K=asp_K)
-                for _ in range(enc_blocks[2])
-            ]
+        self.refine = (
+            nn.Sequential(*[DBlock(c[0]) for _ in range(dec_blocks[2])])
+            if len(dec_blocks) > 2
+            else nn.Identity()
         )
 
-        # Bottleneck readout: low-res image (1x1 conv to RGB)
-        self.readout = nn.Conv2d(c[3], in_ch, kernel_size=1, bias=True)
+        self.readout = nn.Conv2d(c[-1], in_ch, kernel_size=1, bias=True)
 
-        # Decoder (upsample with PixelShuffle)
-        self.up3_proj = nn.Conv2d(
-            c[3], 4 * c[2], kernel_size=1, bias=True
-        )  # for PixelShuffle r=2 -> c2
-        self.dec2 = nn.Sequential(*[DBlock(c[2]) for _ in range(dec_blocks[0])])
-        self.up2_proj = nn.Conv2d(
-            c[2], 4 * c[1], kernel_size=1, bias=True
-        )  # for PixelShuffle r=2 -> c1
-        self.dec1 = nn.Sequential(*[DBlock(c[1]) for _ in range(dec_blocks[0])])
-
-        self.up1_proj = nn.Conv2d(
-            c[1], 4 * c[0], kernel_size=1, bias=True
-        )  # for PixelShuffle r=2 -> c0
-        self.dec0 = nn.Sequential(*[DBlock(c[0]) for _ in range(dec_blocks[1])])
-
-        # final refinement blocks at full res
-        self.refine = nn.Sequential(*[DBlock(c[0]) for _ in range(dec_blocks[2])])
-
-        # final RGB conv
-        self.final = nn.Conv2d(c[0], in_ch, kernel_size=3, padding=1, bias=True)
-
-        # padder size ensures divisible by 4 (2^levels)
-        self.padder_size = 8
+        self.padder_size = 2 ** len(self.encoders)
 
     def forward(self, inp: torch.Tensor, side_loss: bool = False):
         """
@@ -360,52 +401,33 @@ class NoirNetASP(nn.Module):
         B, C, H, W = inp.shape
         x = self._pad_to_divisible(inp)
 
-        # Stem
-        x0 = self.stem(x)  # (B, c0, H, W)
-        # Encoder level 0
-        e0 = self.enc0(x0)
-        d0 = self.down0(e0)  # (B, c1, H/2, W/2)
-        # Encoder level 1
-        e1 = self.enc1(d0)
-        d1 = self.down1(e1)  # (B, c2, H/4, W/4)
-        # Encoder level 2
-        e2 = self.enc2(d1)  # (B, c2, H/4, W/4)
-        # Encoder level 3
-        d2 = self.down2(e2)  # (B, c3, H/8, W/8)
-        e3 = self.enc3(d2)  # (B, c3, H/8, W/8)
+        x = self.stem(x)
 
-        # Bottleneck readout (coarse low-res RGB) computed only if side_loss is requested
+        skips = []
+        for enc, down in zip(self.encoders, self.downs):
+            x = enc(x)
+            skips.append(x)
+            x = down(x)
 
-        # Decoder up 3->2
-        u3 = self.up3_proj(e3)  # (B, 4*c2, H/8, W/8)
-        u3 = nn.PixelShuffle(2)(u3)  # (B, c2, H/4, W/4)
-        u3 = u3 + e2  # skip add
-        d2 = self.dec2(u3)
+        x_light = self.middle_blks_enc(x)
 
-        # Decoder up 2->1
-        u2 = self.up2_proj(d2)  # (B, 4*c1, H/4, W/4)
-        u2 = nn.PixelShuffle(2)(u2)  # (B, c1, H/2, W/2)
-        u2 = u2 + e1  # skip add
-        d1 = self.dec1(u2)
+        if side_loss:
+            lowres = self.readout(x_light)
 
-        # Decoder up 1->0
-        u1 = self.up1_proj(d1)  # (B, 4*c0, H/2, W/2)
-        u1 = nn.PixelShuffle(2)(u1)  # (B, c0, H, W)
-        u1 = u1 + e0
-        d0 = self.dec0(u1)
+        x = self.middle_blks_dec(x_light)
+        x = x + x_light
 
-        # refinement
-        r = self.refine(d0)
+        for up, dec, skip in zip(self.ups, self.decoders, reversed(skips)):
+            x = up(x)
+            x = x + skip
+            x = dec(x)
 
-        out = self.final(r)
-        # residual to input
-        out = out + inp
-        # unpad
+        x = self.refine(x)
+        out = self.final(x)
+
         out = self._unpad_to_orig(out, H, W)
 
         if side_loss:
-            # also return low-resolution readout (up-sample to original size if needed)
-            lowres = self.readout(e3)  # (B, 3, H/8, W/8)
             lowres_ups = F.interpolate(
                 lowres, size=(H, W), mode="bilinear", align_corners=False
             )
