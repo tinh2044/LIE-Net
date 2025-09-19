@@ -1,20 +1,21 @@
 import os
-import time
 import argparse
 import json
-import datetime
 from pathlib import Path
 
 import torch
-import torch.nn as nn
 import torch.utils.data as data
 
+# Configure PJRT/XLA before importing torch_xla (Colab/Kaggle TPU)
+if "PJRT_DEVICE" not in os.environ:
+    if os.environ.get("COLAB_TPU_ADDR") or os.environ.get("TPU_NAME"):
+        os.environ["PJRT_DEVICE"] = "TPU"
+os.environ.setdefault("XLA_USE_SPMD", "1")
+
 # PyTorch/XLA imports
-import torch_xla
 import torch_xla.core.xla_model as xm
 import torch_xla.distributed.parallel_loader as pl
 import torch_xla.distributed.xla_multiprocessing as xmp
-import torch_xla.utils.utils as xu
 
 import yaml
 import numpy as np
@@ -242,7 +243,8 @@ def tpu_train_eval(rank, args, cfg):
                 # Compute PSNR/SSIM using existing metrics function if available
                 from metrics import compute_metrics
 
-                metrics = compute_metrics(targets, preds, device)
+                # Run metrics on CPU to avoid TPU-incompatible ops (e.g., LPIPS)
+                metrics = compute_metrics(targets.cpu(), preds.cpu(), device="cpu")
                 agg["psnr"] += float(metrics.get("psnr", 0.0))
                 agg["ssim"] += float(metrics.get("ssim", 0.0))
                 agg["charbonnier"] += float(loss_dict["charbonnier"].item())
@@ -404,6 +406,160 @@ def tpu_train_eval(rank, args, cfg):
         xm.rendezvous("epoch_end")
 
 
+def run_cpu_gpu(args, cfg):
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    # Seeds
+    seed = args.seed
+    torch.manual_seed(seed)
+    np.random.seed(seed)
+    random.seed(seed)
+
+    cfg_data = cfg["data"]
+    train_set = get_training_set(cfg_data["root"], cfg_data)
+    test_set = get_test_set(cfg_data["root"], cfg_data)
+
+    train_loader = data.DataLoader(
+        train_set,
+        batch_size=args.batch_size,
+        shuffle=True,
+        num_workers=args.num_workers,
+        drop_last=True,
+        collate_fn=train_set.data_collator
+        if hasattr(train_set, "data_collator")
+        else None,
+    )
+    test_loader = data.DataLoader(
+        test_set,
+        batch_size=args.batch_size,
+        shuffle=False,
+        num_workers=args.num_workers,
+        drop_last=False,
+        collate_fn=test_set.data_collator
+        if hasattr(test_set, "data_collator")
+        else None,
+    )
+
+    model = NoirNetASP(**cfg["model"]).to(device)
+    loss_fn = LowLightLoss(cfg["loss"]).to(device)
+    optimizer = build_optimizer(
+        config=cfg.get("training", {}).get("optimization", {}), model=model
+    )
+    for group in optimizer.param_groups:
+        if "initial_lr" not in group:
+            group["initial_lr"] = group["lr"]
+    if "training" not in cfg:
+        cfg["training"] = {}
+    if "optimization" not in cfg["training"]:
+        cfg["training"]["optimization"] = {}
+    cfg["training"]["optimization"]["total_epochs"] = args.epochs
+    scheduler, _ = build_scheduler(
+        config=cfg["training"]["optimization"], optimizer=optimizer, last_epoch=-1
+    )
+
+    start_epoch = 0
+    if args.resume:
+        ret, missing, unexpected, checkpoint = utils.load_pretrained_flexibly(
+            model, args.resume, device="cpu", strict=False
+        )
+        if isinstance(checkpoint, dict) and "epoch" in checkpoint:
+            start_epoch = checkpoint["epoch"] + 1
+            if "optimizer_state_dict" in checkpoint:
+                optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+            if (
+                hasattr(scheduler, "load_state_dict")
+                and "scheduler_state_dict" in checkpoint
+            ):
+                scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
+
+    if args.finetune and not args.resume:
+        utils.load_pretrained_flexibly(model, args.finetune, device="cpu", strict=False)
+
+    out_dir = Path(
+        cfg.get("training", {}).get("model_dir", "outputs/noirnetasp_cpu_gpu")
+    )
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    class LocalArgs:
+        pass
+
+    local_args = LocalArgs()
+    local_args.device = device
+    local_args.output_dir = str(out_dir)
+    local_args.save_images = args.save_images or cfg.get("evaluation", {}).get(
+        "save_images", False
+    )
+    local_args.print_freq = args.print_freq
+
+    if args.eval:
+        results = evaluate_fn_cpu_gpu(
+            local_args,
+            test_loader,
+            model,
+            epoch=start_epoch,
+            loss_fn=loss_fn,
+            print_freq=args.print_freq,
+            results_path=str(out_dir / "test_results.json"),
+            log_dir=str(out_dir / "log_eval_test"),
+        )
+        print(
+            f"Eval: PSNR={results.get('psnr', 0.0):.3f} SSIM={results.get('ssim', 0.0):.3f}"
+        )
+        return
+
+    best_psnr = 0.0
+    for epoch in range(start_epoch, args.epochs):
+        train_stats = train_one_epoch_cpu_gpu(
+            local_args,
+            model,
+            train_loader,
+            optimizer,
+            epoch,
+            loss_fn,
+            print_freq=args.print_freq,
+            log_dir=str(out_dir / "log" / "train"),
+        )
+        scheduler.step()
+
+        torch.save(
+            {
+                "model_state_dict": model.state_dict(),
+                "optimizer_state_dict": optimizer.state_dict(),
+                "scheduler_state_dict": scheduler.state_dict()
+                if hasattr(scheduler, "state_dict")
+                else {},
+                "epoch": epoch,
+            },
+            out_dir / f"checkpoint_{epoch}.pth",
+        )
+
+        test_results = evaluate_fn_cpu_gpu(
+            local_args,
+            test_loader,
+            model,
+            epoch,
+            loss_fn,
+            print_freq=args.print_freq,
+            log_dir=str(out_dir / "log" / "test"),
+        )
+
+        if test_results.get("psnr", 0.0) > best_psnr:
+            best_psnr = test_results["psnr"]
+            torch.save(
+                {
+                    "model_state_dict": model.state_dict(),
+                    "optimizer_state_dict": optimizer.state_dict(),
+                    "scheduler_state_dict": scheduler.state_dict()
+                    if hasattr(scheduler, "state_dict")
+                    else {},
+                    "epoch": epoch,
+                },
+                out_dir / "best_checkpoint.pth",
+            )
+        print(
+            f"* TEST PSNR {test_results.get('psnr', 0.0):.3f} Best PSNR {best_psnr:.3f}"
+        )
+
+
 def _mp_fn(rank, args_serialized):
     args, cfg = args_serialized
     tpu_train_eval(rank, args, cfg)
@@ -425,5 +581,13 @@ if __name__ == "__main__":
     if not out_dir.exists():
         out_dir.mkdir(parents=True, exist_ok=True)
 
-    # Spawn 8 TPU processes by default. XLA decides world size via env.
-    xmp.spawn(_mp_fn, args=((args, config),), nprocs=None, start_method="fork")
+    # Try TPU via PJRT first; fall back to CPU/GPU if TPU init fails.
+    try:
+        # 'spawn' is safer than 'fork' across environments
+        xmp.spawn(_mp_fn, args=((args, config),), nprocs=None, start_method="spawn")
+    except Exception as e:
+        print(
+            "[WARN] TPU init failed, falling back to CPU/GPU single-process training."
+        )
+        print(str(e))
+        run_cpu_gpu(args, config)
